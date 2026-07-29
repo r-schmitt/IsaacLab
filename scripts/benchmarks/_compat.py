@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import statistics
 import sys
 from collections.abc import Iterator, Sequence
@@ -205,12 +206,43 @@ def parse_benchmark_cli(
     """
     args, remaining = parser.parse_known_args(list(argv))
     enforce_physx_only(remaining)
+    resolve_headless(args)
     hydra_overrides, preset_tokens = partition_tokens(remaining)
     # Only genuine Hydra overrides reach the hydra_task_config parser; the
     # consumed preset selectors (e.g. ``presets=physx``) are dropped so 2.3.2
     # Hydra does not reject an unknown key.
     sys.argv = [sys.argv[0]] + hydra_overrides
     return args, preset_tokens
+
+
+# Env escape hatch to keep a GUI window (local debugging). Any of these values
+# opts out of the forced-headless default.
+_GUI_ENV_VAR = "OMNIPERF_BENCHMARK_GUI"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def resolve_headless(args: argparse.Namespace) -> None:
+    """Force a headless launch for benchmark runs (2.x fork).
+
+    Upstream develop runs the unified suite headless via Isaac Lab's own launch
+    logic. On 2.3.2 the omniperf runner drives these entry points *without*
+    passing ``--headless`` and ``AppLauncher`` defaults ``headless=False`` — a GUI
+    window that needs a display and adds viewport/UI overhead which skews the
+    frametime/FPS KPIs (and is not the standard benchmark configuration). So we
+    default headless on here.
+
+    Must run before :func:`launch_kit`: ``AppLauncher`` reads ``headless`` at
+    construction and selects the (no-UI) experience file from it.
+
+    Set ``OMNIPERF_BENCHMARK_GUI=1`` to opt out for local GUI debugging.
+
+    Args:
+        args: Parsed namespace with the ``AppLauncher`` arguments; mutated in
+            place so ``args.headless`` reflects the decision.
+    """
+    if os.environ.get(_GUI_ENV_VAR, "").strip().lower() in _TRUTHY:
+        return
+    args.headless = True
 
 
 @contextlib.contextmanager
@@ -255,6 +287,80 @@ def run_config(tokens: Sequence[str], *, enable_cameras: bool):
         rendering_backend="isaacsim_rtx" if enable_cameras else "none",
         presets=[t for t in tokens if t.strip()],
     )
+
+
+# ---------------------------------------------------------------------------
+# Camera enabling (pre-launch) — pure, Kit-free.
+#
+# 3.x auto-enables cameras inside ``launch_simulation`` by scanning the
+# *resolved* env cfg for ``CameraCfg`` sensors (``sim_launcher.scan`` /
+# ``has_kit_camera``). On 2.3.2 the cfg is resolved only *after* Kit launches
+# (via ``hydra_task_config``), yet ``AppLauncher`` picks the RTX experience file
+# from ``enable_cameras`` at construction — so the decision must be made before
+# ``launch_kit``, when the resolved cfg is not yet available. These helpers use
+# pre-launch signals only (explicit flags + a task-id heuristic); an exact
+# cfg-sensor probe is intentionally deferred (see HANDOFF).
+# ---------------------------------------------------------------------------
+
+# Substrings marking a vision/camera task variant in the Gym id (case-insensitive).
+# Isaac Lab registers camera variants with markers like ``-Camera-`` / ``-RGB-`` /
+# ``-Depth-`` / ``-Tiled-``; matching the raw id needs no config import (Kit-free)
+# and is unaffected by the ``-v0`` suffix.
+_CAMERA_TASK_ID_MARKERS = ("camera", "rgb", "rgbd", "depth", "tiled")
+
+
+def task_id_implies_cameras(task: str) -> bool:
+    """Heuristic: whether *task*'s Gym id names a vision/camera variant.
+
+    Args:
+        task: Task id as passed on the CLI (raw; pre ``-v0`` resolution).
+
+    Returns:
+        ``True`` if the id contains a camera-variant marker.
+    """
+    low = task.lower()
+    return any(marker in low for marker in _CAMERA_TASK_ID_MARKERS)
+
+
+def _kit_args_request_cameras(args: argparse.Namespace) -> bool:
+    """Whether ``--kit_args`` carries an ``--enable_cameras`` passthrough.
+
+    ``AppLauncher`` forwards ``--kit_args`` to Kit's ``sys.argv`` but does not
+    read ``enable_cameras`` out of them, so a runner that routes the flag there
+    would otherwise be ignored. Detecting it here lets us set the real flag.
+    """
+    kit_args = getattr(args, "kit_args", None)
+    if not kit_args:
+        return False
+    text = kit_args if isinstance(kit_args, str) else " ".join(kit_args)
+    return "--enable_cameras" in text
+
+
+def resolve_enable_cameras(args: argparse.Namespace, task: str) -> bool:
+    """Decide (and set on *args*) whether cameras must be enabled before Kit launches.
+
+    Enables cameras when any pre-launch signal holds: an explicit
+    ``--enable_cameras``; ``--video`` (capture needs the render pipeline); an
+    ``--enable_cameras`` passthrough inside ``--kit_args``; or a vision task id
+    (:func:`task_id_implies_cameras`). Must be called before :func:`launch_kit`.
+
+    Args:
+        args: Parsed namespace with the ``AppLauncher`` arguments; mutated in
+            place so ``args.enable_cameras`` reflects the decision.
+        task: Task id as passed on the CLI (raw; pre ``-v0`` resolution).
+
+    Returns:
+        ``True`` when cameras were enabled.
+    """
+    enabled = (
+        bool(getattr(args, "enable_cameras", False))
+        or bool(getattr(args, "video", False))
+        or _kit_args_request_cameras(args)
+        or task_id_implies_cameras(task)
+    )
+    if enabled:
+        args.enable_cameras = True
+    return enabled
 
 
 # ---------------------------------------------------------------------------

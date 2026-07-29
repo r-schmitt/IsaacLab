@@ -64,6 +64,9 @@ def run(argv: list[str]) -> None:
     parser = _build_parser()
     # Enforces PhysX-only and moves Hydra overrides onto ``sys.argv`` before Kit launches.
     args, preset_tokens = _compat.parse_benchmark_cli(parser, argv)
+    # Enable cameras before launch for vision tasks / explicit signals (the runner
+    # does not inject --enable_cameras; AppLauncher reads it at construction).
+    _compat.resolve_enable_cameras(args, args.task)
 
     app_t0 = time.perf_counter_ns()
     with _compat.launch_kit(args):

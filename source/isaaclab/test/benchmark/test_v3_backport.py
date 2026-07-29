@@ -259,6 +259,71 @@ def test_compat_partition_and_run_config() -> None:
     assert compat.run_config([], enable_cameras=False).rendering_backend == "none"
 
 
+def test_compat_resolve_enable_cameras() -> None:
+    """Pre-launch camera enabling: task-id heuristic (opt 1) + explicit signals (opt 3)."""
+    import argparse
+
+    compat = importlib.import_module("_compat")
+
+    # Task-id heuristic: vision variants match; plain PhysX tasks do not.
+    assert compat.task_id_implies_cameras("Isaac-Reorient-Cube-Shadow-Camera-Direct-v0")
+    assert compat.task_id_implies_cameras("Isaac-Something-RGB-v0")
+    assert compat.task_id_implies_cameras("Isaac-Depth-Nav-v0")
+    assert not compat.task_id_implies_cameras("Isaac-Cartpole-Direct-v0")
+
+    def _ns(**kw):
+        ns = argparse.Namespace(enable_cameras=False, video=False, kit_args=None)
+        ns.__dict__.update(kw)
+        return ns
+
+    # Camera task id -> enabled, and the flag is set in place.
+    ns = _ns()
+    assert compat.resolve_enable_cameras(ns, "Isaac-Reorient-Cube-Shadow-Camera-Direct-v0") is True
+    assert ns.enable_cameras is True
+    # Non-camera task with no signals -> not enabled.
+    ns = _ns()
+    assert compat.resolve_enable_cameras(ns, "Isaac-Cartpole-Direct-v0") is False
+    assert ns.enable_cameras is False
+    # Explicit signals each force-enable a non-camera task.
+    assert compat.resolve_enable_cameras(_ns(video=True), "Isaac-Cartpole-Direct-v0") is True
+    assert compat.resolve_enable_cameras(_ns(enable_cameras=True), "Isaac-Cartpole-Direct-v0") is True
+    assert compat.resolve_enable_cameras(
+        _ns(kit_args="--/log/file=/tmp/x.log --enable_cameras"), "Isaac-Cartpole-Direct-v0"
+    ) is True
+
+
+def test_compat_resolve_headless() -> None:
+    """Benchmark runs force headless (runner never passes --headless); env opt-out."""
+    import argparse
+
+    compat = importlib.import_module("_compat")
+
+    def _ns():
+        return argparse.Namespace(headless=False)
+
+    saved = os.environ.pop("OMNIPERF_BENCHMARK_GUI", None)
+    try:
+        # Default: runner path (no --headless) -> forced headless on.
+        ns = _ns()
+        compat.resolve_headless(ns)
+        assert ns.headless is True
+        # Env escape hatch keeps the GUI window for local debugging.
+        for val in ("1", "true", "YES", "on"):
+            os.environ["OMNIPERF_BENCHMARK_GUI"] = val
+            ns = _ns()
+            compat.resolve_headless(ns)
+            assert ns.headless is False, f"{val!r} should opt out of forced headless"
+        # A non-truthy value does not opt out.
+        os.environ["OMNIPERF_BENCHMARK_GUI"] = "0"
+        ns = _ns()
+        compat.resolve_headless(ns)
+        assert ns.headless is True
+    finally:
+        os.environ.pop("OMNIPERF_BENCHMARK_GUI", None)
+        if saved is not None:
+            os.environ["OMNIPERF_BENCHMARK_GUI"] = saved
+
+
 def test_compat_extract_rsl_rl_series() -> None:
     """rsl_rl tag->series mapping, incl. the 2.3.2 ``"Perf/collection time"`` spelling (SPEC §5)."""
     compat = importlib.import_module("_compat")
@@ -364,6 +429,8 @@ def _run_all() -> int:
         test_startup_bundle_roundtrip,
         test_compat_physx_enforcement,
         test_compat_partition_and_run_config,
+        test_compat_resolve_enable_cameras,
+        test_compat_resolve_headless,
         test_compat_extract_rsl_rl_series,
         test_compat_extract_rl_games_series,
         test_compat_success_tail_mean,

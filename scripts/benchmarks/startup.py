@@ -113,6 +113,9 @@ def run(argv: list[str]) -> None:
     start_utc = datetime.now(timezone.utc).isoformat()
     parser = _build_parser()
     args, preset_tokens = _compat.parse_benchmark_cli(parser, argv)
+    # Enable cameras before launch for vision tasks / explicit signals (the runner
+    # does not inject --enable_cameras; AppLauncher reads it at construction).
+    _compat.resolve_enable_cameras(args, args.task)
 
     whitelist = _load_whitelist(args.whitelist_config)
     top_n = args.top_n if args.top_n is not None else (5 if whitelist else 30)

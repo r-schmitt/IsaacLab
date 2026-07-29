@@ -133,8 +133,9 @@ def run(argv: list[str]) -> None:
     parser, rsl_rl_cli = _build_parser(rl_library)
     # Enforces PhysX-only and moves Hydra overrides onto ``sys.argv`` before Kit launches.
     args, preset_tokens = _compat.parse_benchmark_cli(parser, argv)
-    if args.video:
-        args.enable_cameras = True
+    # Enable cameras before launch for vision tasks / --video / explicit signals
+    # (AppLauncher picks the RTX experience file from this at construction).
+    _compat.resolve_enable_cameras(args, args.task)
 
     app_t0 = time.perf_counter_ns()
     with _compat.launch_kit(args):
