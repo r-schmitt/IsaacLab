@@ -110,6 +110,9 @@ def run(argv: list[str]) -> None:
     Args:
         argv: Command-line arguments excluding the script path.
     """
+    # Make Hydra re-raise the real task exception (it otherwise suppresses the
+    # traceback and sys.exit(1)s) so capture_launch_errors can persist it.
+    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
     start_utc = datetime.now(timezone.utc).isoformat()
     parser = _build_parser()
     args, preset_tokens = _compat.parse_benchmark_cli(parser, argv)
@@ -123,7 +126,7 @@ def run(argv: list[str]) -> None:
     app_launch_profile = cProfile.Profile()
     app_t0 = time.perf_counter_ns()
     app_launch_profile.enable()
-    with _compat.launch_kit(args):
+    with _compat.launch_kit(args), _compat.capture_launch_errors(args.output_path, "startup"):
         app_launch_profile.disable()
         app_launch_wall_ms = (time.perf_counter_ns() - app_t0) / 1e6
 

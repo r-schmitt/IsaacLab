@@ -265,6 +265,49 @@ def launch_kit(args: argparse.Namespace):
         app_launcher.app.close()
 
 
+@contextlib.contextmanager
+def capture_launch_errors(output_path: str, name: str):
+    """Persist a post-launch traceback before the runner's force-exit swallows it.
+
+    The omniperf runner patches ``SimulationApp.close()`` to ``os._exit(0)`` (to
+    dodge a Kit viewport shutdown deadlock). When a benchmark entry point raises
+    *after* Kit launch, that force-exit runs in :func:`launch_kit`'s ``finally``
+    during unwinding and discards the traceback — and the process exits 0, so the
+    runner only reports "no result files" with no root cause. Hydra
+    (``hydra_task_config``) compounds this by suppressing the task traceback unless
+    ``HYDRA_FULL_ERROR=1`` (the entry points set it). This wrapper writes the
+    traceback to ``{output_path}/benchmark_error_{name}.txt`` (and stderr) first.
+
+    Use it in the *same* ``with`` as :func:`launch_kit`, listed **second** so its
+    ``__exit__`` runs before ``launch_kit`` closes the app::
+
+        with launch_kit(args), capture_launch_errors(args.output_path, "runtime"):
+            ...
+
+    Args:
+        output_path: Directory to write the error file into (the ``--output_path``).
+        name: Short entry-point tag used in the error file name.
+    """
+    try:
+        yield
+    except BaseException:
+        import traceback
+
+        tb = traceback.format_exc()
+        try:
+            os.makedirs(output_path, exist_ok=True)
+            with open(os.path.join(output_path, f"benchmark_error_{name}.txt"), "w", encoding="utf-8") as fh:
+                fh.write(tb)
+        except Exception:
+            pass
+        try:
+            sys.stderr.write(tb)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        raise
+
+
 def run_config(tokens: Sequence[str], *, enable_cameras: bool):
     """Build a PhysX ``RunConfig`` without touching the 3.x preset layer.
 

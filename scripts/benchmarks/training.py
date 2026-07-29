@@ -124,6 +124,9 @@ def run(argv: list[str]) -> None:
     Args:
         argv: Command-line arguments excluding the script path.
     """
+    # Make Hydra re-raise the real task exception (it otherwise suppresses the
+    # traceback and sys.exit(1)s) so capture_launch_errors can persist it.
+    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
     # Pre-parse ``--rl_library`` so the parser can add library-specific args.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--rl_library", choices=sorted(_AGENT_ENTRY_POINT), required=True)
@@ -138,7 +141,7 @@ def run(argv: list[str]) -> None:
     _compat.resolve_enable_cameras(args, args.task)
 
     app_t0 = time.perf_counter_ns()
-    with _compat.launch_kit(args):
+    with _compat.launch_kit(args), _compat.capture_launch_errors(args.output_path, "training"):
         app_t1 = time.perf_counter_ns()
 
         imports_t0 = time.perf_counter_ns()
