@@ -265,8 +265,10 @@ def test_compat_resolve_enable_cameras() -> None:
 
     compat = importlib.import_module("_compat")
 
-    # Task-id heuristic: vision variants match; plain PhysX tasks do not.
+    # Task-id heuristic: vision variants match; plain PhysX tasks do not. Both the
+    # develop ``-Camera-`` name and its 2.3.2 ``-Vision-`` rename must match.
     assert compat.task_id_implies_cameras("Isaac-Reorient-Cube-Shadow-Camera-Direct-v0")
+    assert compat.task_id_implies_cameras("Isaac-Repose-Cube-Shadow-Vision-Direct-v0")
     assert compat.task_id_implies_cameras("Isaac-Something-RGB-v0")
     assert compat.task_id_implies_cameras("Isaac-Depth-Nav-v0")
     assert not compat.task_id_implies_cameras("Isaac-Cartpole-Direct-v0")
@@ -290,6 +292,27 @@ def test_compat_resolve_enable_cameras() -> None:
     assert compat.resolve_enable_cameras(
         _ns(kit_args="--/log/file=/tmp/x.log --enable_cameras"), "Isaac-Cartpole-Direct-v0"
     ) is True
+
+
+def test_compat_task_id_renames() -> None:
+    """Develop matrix ids that were *renamed* on 2.3.2 map to the fork's base ids.
+
+    ``resolve_task_id`` itself needs the live gym registry (Kit), so here we assert
+    the static rename table the runner depends on: the develop names emitted by
+    BENCHMARK_CONFIGS_FULL must map to the exact 2.3.2 base ids (pre ``-v0``).
+    """
+    compat = importlib.import_module("_compat")
+
+    expected = {
+        "Isaac-Reorient-Cube-Shadow-Camera-Direct": "Isaac-Repose-Cube-Shadow-Vision-Direct",
+        "IsaacContrib-Factory-GearMesh-Direct": "Isaac-Factory-GearMesh-Direct",
+        "Isaac-Velocity-Rough-AnymalD": "Isaac-Velocity-Rough-Anymal-D",
+        "Isaac-Lift-KukaAllegro": "Isaac-Dexsuite-Kuka-Allegro-Lift",
+    }
+    assert compat._TASK_ID_RENAMES == expected
+    # Unchanged ids must NOT be in the table (the plain ``-v0`` path handles them).
+    for unchanged in ("Isaac-Cartpole-Direct", "Isaac-Velocity-Rough-G1", "Isaac-Velocity-Flat-G1"):
+        assert unchanged not in compat._TASK_ID_RENAMES
 
 
 def test_compat_resolve_headless() -> None:
@@ -430,6 +453,7 @@ def _run_all() -> int:
         test_compat_physx_enforcement,
         test_compat_partition_and_run_config,
         test_compat_resolve_enable_cameras,
+        test_compat_task_id_renames,
         test_compat_resolve_headless,
         test_compat_extract_rsl_rl_series,
         test_compat_extract_rl_games_series,

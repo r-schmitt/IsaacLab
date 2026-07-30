@@ -143,28 +143,47 @@ def enforce_physx_only(tokens: Sequence[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def resolve_task_id(task: str) -> str:
-    """Return the registered Gym id for ``task``, adding the 2.3.2 ``-v0`` suffix if needed.
+# Develop (3.x) benchmark-matrix task ids that were *renamed* on 2.3.2 — not just
+# ``-v0``-suffixed. The omniperf runner's BENCHMARK_CONFIGS_FULL emits the develop
+# names (it stays version-agnostic); the fork owns the mapping to its own registry.
+# Left = name the runner passes on ``--task``; right = 2.3.2 base id (pre ``-v0``,
+# which :func:`resolve_task_id` then appends). Verified against the 2.3.2 gym
+# registrations. Ids unchanged across versions (e.g. Cartpole, Velocity-*-G1) are
+# absent — the plain ``-v0`` path already resolves them.
+_TASK_ID_RENAMES: dict[str, str] = {
+    "Isaac-Reorient-Cube-Shadow-Camera-Direct": "Isaac-Repose-Cube-Shadow-Vision-Direct",
+    "IsaacContrib-Factory-GearMesh-Direct": "Isaac-Factory-GearMesh-Direct",
+    "Isaac-Velocity-Rough-AnymalD": "Isaac-Velocity-Rough-Anymal-D",
+    "Isaac-Lift-KukaAllegro": "Isaac-Dexsuite-Kuka-Allegro-Lift",
+}
 
-    2.3.2 registers ids with a ``-v0`` suffix (e.g. ``Isaac-Cartpole-Direct-v0``).
-    ``gym.make`` requires the exact registered id. If ``task`` is already
-    registered it is returned unchanged; otherwise ``<task>-v0`` is tried.
+
+def resolve_task_id(task: str) -> str:
+    """Return the registered Gym id for ``task``, remapping renamed ids and adding ``-v0``.
+
+    2.3.2 registers ids with a ``-v0`` suffix (e.g. ``Isaac-Cartpole-Direct-v0``)
+    and, for some tasks, under a *different* base name than develop (see
+    :data:`_TASK_ID_RENAMES`). ``gym.make`` requires the exact registered id.
+    Resolution order: (1) ``task`` as-is; (2) ``<task>-v0``; (3) the 2.3.2 rename
+    as-is; (4) ``<rename>-v0``. If nothing matches, ``task`` is returned unchanged
+    so the caller still gets Gym's native "No registered env" error.
 
     Args:
         task: Task id as passed on the CLI (with or without a version suffix).
 
     Returns:
-        A registered task id when one can be found, else ``task`` unchanged (so
-        the caller still gets Gym's native "No registered env" error).
+        A registered task id when one can be found, else ``task`` unchanged.
     """
     import gymnasium as gym
 
     registry = gym.registry
-    if task in registry:
-        return task
-    candidate = f"{task}-v0"
-    if candidate in registry:
-        return candidate
+    candidates = [task, f"{task}-v0"]
+    renamed = _TASK_ID_RENAMES.get(task)
+    if renamed is not None:
+        candidates += [renamed, f"{renamed}-v0"]
+    for candidate in candidates:
+        if candidate in registry:
+            return candidate
     return task
 
 
@@ -347,9 +366,11 @@ def run_config(tokens: Sequence[str], *, enable_cameras: bool):
 
 # Substrings marking a vision/camera task variant in the Gym id (case-insensitive).
 # Isaac Lab registers camera variants with markers like ``-Camera-`` / ``-RGB-`` /
-# ``-Depth-`` / ``-Tiled-``; matching the raw id needs no config import (Kit-free)
-# and is unaffected by the ``-v0`` suffix.
-_CAMERA_TASK_ID_MARKERS = ("camera", "rgb", "rgbd", "depth", "tiled")
+# ``-Depth-`` / ``-Tiled-`` (and, on 2.3.2, ``-Vision-``); matching the raw id needs
+# no config import (Kit-free) and is unaffected by the ``-v0`` suffix. Both the
+# develop name (``-Camera-``) and its 2.3.2 rename (``-Vision-``) are covered so the
+# heuristic holds whether it runs before or after :func:`resolve_task_id`.
+_CAMERA_TASK_ID_MARKERS = ("camera", "rgb", "rgbd", "depth", "tiled", "vision")
 
 
 def task_id_implies_cameras(task: str) -> bool:
