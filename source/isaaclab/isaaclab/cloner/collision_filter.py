@@ -53,18 +53,26 @@ def filter_collisions(
     with Usd.EditContext(stage, Usd.EditTarget(stage.GetRootLayer())):
         UsdGeom.Scope.Define(stage, collision_root_path)
 
+    # Loop-invariant handles hoisted out of the per-environment loop below: the collision-root
+    # parent spec and the collider-collection API token list are identical for every group, so
+    # resolving/constructing them once (instead of once per environment) removes O(num_envs)
+    # redundant layer lookups and TokenListOp allocations from scene construction.
+    collision_root_spec = stage.GetRootLayer().GetPrimAtPath(collision_root_path)
+    colliders_api_schemas = Sdf.TokenListOp.Create({"CollectionAPI:colliders"})
+    has_global = len(global_paths) > 0
+
     with Sdf.ChangeBlock():
-        if len(global_paths) > 0:
+        if has_global:
             global_collision_group_path = collision_root_path + "/global_group"
             # add collision group prim
             global_collision_group = Sdf.PrimSpec(
-                stage.GetRootLayer().GetPrimAtPath(collision_root_path),
+                collision_root_spec,
                 "global_group",
                 Sdf.SpecifierDef,
                 "PhysicsCollisionGroup",
             )
             # prepend collision API schema
-            global_collision_group.SetInfo(Usd.Tokens.apiSchemas, Sdf.TokenListOp.Create({"CollectionAPI:colliders"}))
+            global_collision_group.SetInfo(Usd.Tokens.apiSchemas, colliders_api_schemas)
 
             # expansion rule
             expansion_rule = Sdf.AttributeSpec(
@@ -77,28 +85,29 @@ def filter_collisions(
 
             # includes rel
             global_includes_rel = Sdf.RelationshipSpec(global_collision_group, "collection:colliders:includes", False)
-            for global_path in global_paths:
-                global_includes_rel.targetPathList.Append(global_path)
+            global_includes_rel.targetPathList.appendedItems = list(global_paths)
 
             # filteredGroups rel
             global_filtered_groups = Sdf.RelationshipSpec(global_collision_group, "physics:filteredGroups", False)
             # We are using inverted collision group filtering, which means objects by default don't collide across
             # groups. We need to add this group as a filtered group, so that objects within this group collide with
-            # each other.
-            global_filtered_groups.targetPathList.Append(global_collision_group_path)
+            # each other. Per-environment groups are accumulated here and assigned in a single bulk write after the
+            # loop: appending to this relationship one path at a time is O(num_envs) per call (list-op uniqueness
+            # check), i.e. O(num_envs^2) overall, which dominates scene construction at high environment counts.
+            global_filtered_paths = [global_collision_group_path]
 
         # set collision groups and filters
         for i, prim_path in enumerate(prim_paths):
             collision_group_path = collision_root_path + f"/group{i}"
             # add collision group prim
             collision_group = Sdf.PrimSpec(
-                stage.GetRootLayer().GetPrimAtPath(collision_root_path),
+                collision_root_spec,
                 f"group{i}",
                 Sdf.SpecifierDef,
                 "PhysicsCollisionGroup",
             )
             # prepend collision API schema
-            collision_group.SetInfo(Usd.Tokens.apiSchemas, Sdf.TokenListOp.Create({"CollectionAPI:colliders"}))
+            collision_group.SetInfo(Usd.Tokens.apiSchemas, colliders_api_schemas)
 
             # expansion rule
             expansion_rule = Sdf.AttributeSpec(
@@ -119,6 +128,12 @@ def filter_collisions(
             # groups. We need to add this group as a filtered group, so that objects within this group collide with
             # each other.
             filtered_groups.targetPathList.Append(collision_group_path)
-            if len(global_paths) > 0:
+            if has_global:
                 filtered_groups.targetPathList.Append(global_collision_group_path)
-                global_filtered_groups.targetPathList.Append(collision_group_path)
+                global_filtered_paths.append(collision_group_path)
+
+        # Single bulk write of the global group's filtered-groups targets (see note above). This is
+        # byte-for-byte identical to appending each path individually, but O(num_envs) instead of
+        # O(num_envs^2).
+        if has_global:
+            global_filtered_groups.targetPathList.appendedItems = global_filtered_paths
