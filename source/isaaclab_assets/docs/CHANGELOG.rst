@@ -1,6 +1,34 @@
 Changelog
 ---------
 
+0.6.3 (2026-08-05)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Updated the Menagerie Franka configuration to use its corrected USD-authored arm drive gains.
+
+
+0.6.2 (2026-08-01)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed the DR Legs feet colliding as bounding boxes by setting an explicit ``convexHull`` mesh
+  approximation on :data:`~isaaclab_assets.robots.dr_legs.DR_LEGS_IMPLICIT_PD_CFG`.
+
+
+0.6.1 (2026-07-30)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed :data:`~isaaclab_assets.sensors.GELSIGHT_MINI_CFG` to use the available GelSight render data.
+
+
 0.6.0 (2026-07-29)
 ~~~~~~~~~~~~~~~~~~
 

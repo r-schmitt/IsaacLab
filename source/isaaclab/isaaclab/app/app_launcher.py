@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import importlib.util
 import inspect
 import logging
 import os
@@ -25,9 +26,12 @@ import signal
 import sys
 from typing import Any, Literal
 
-with contextlib.suppress(ModuleNotFoundError):
+try:
     import isaacsim  # noqa: F401
-    from isaacsim import SimulationApp
+except ModuleNotFoundError:
+    isaacsim = None
+
+SimulationApp = getattr(isaacsim, "SimulationApp", None)
 
 from isaaclab.app.logging_utils import apply_python_logging_level, resolve_python_logging_level
 from isaaclab.app.settings_manager import get_settings_manager, initialize_carb_settings
@@ -240,6 +244,7 @@ class AppLauncher:
                 the :attr:`launcher_args` will raise a ValueError.
 
         Raises:
+            ImportError: If the full Isaac Sim runtime is unavailable.
             ValueError: If there are common/duplicated arguments between ``launcher_args`` and ``kwargs``.
             ValueError: If combination of ``launcher_args`` and ``kwargs`` are missing the necessary arguments
                 that are needed by the AppLauncher to resolve the desired app configuration.
@@ -249,6 +254,12 @@ class AppLauncher:
         .. _argparse.Namespace: https://docs.python.org/3/library/argparse.html?highlight=namespace#argparse.Namespace
         .. _SimulationApp: https://docs.isaacsim.omniverse.nvidia.com/latest/py/source/extensions/isaacsim.simulation_app/docs/index.html#isaacsim.simulation_app.SimulationApp
         """
+        if not self.is_available():
+            raise ImportError(
+                "AppLauncher requires the full Isaac Sim runtime. Install Isaac Sim or avoid constructing "
+                "AppLauncher in a kitless process."
+            )
+
         # We allow users to pass either a dict or an argparse.Namespace into
         # __init__, anticipating that these will be all of the argparse arguments
         # used by the calling script. Those which we appended via add_app_launcher_args
@@ -355,9 +366,44 @@ class AppLauncher:
         else:
             raise RuntimeError("The `AppLauncher.app` member cannot be retrieved until the class is initialized.")
 
+    @property
+    def has_window(self) -> bool:
+        """Whether a window exists that can render UI and receive input.
+
+        True when a windowed visualizer was requested, or when livestreaming, which renders a
+        window and forwards input from the remote client. Use this rather than the headless
+        state to decide whether UI-driven features are available: livestreaming runs the host
+        headless yet still presents an interactive window.
+
+        Distinct from :meth:`has_gui`, which also counts an XR session as interactive. A
+        windowless XR run has somewhere to display but no window to click in or type into, so
+        prefer this for keyboard bindings, viewport widgets, and other window-bound features.
+        """
+        return not self._headless or self._livestream >= 1
+
     """
     Operations.
     """
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """Return whether the full Isaac Sim runtime is importable, i.e. Kit can be launched.
+
+        This reports launchability, not running state: it is ``True`` in any process with a
+        full Isaac Sim installation, before and after Kit starts. Use
+        :func:`~isaaclab.utils.version.has_kit` to check whether Kit is currently running.
+        """
+        return SimulationApp is not None
+
+    @classmethod
+    def has_gui(cls) -> bool:
+        """Return whether the resolved app state has an interactive GUI.
+
+        ``True`` when the launch resolved to a local window, a livestream, or an XR session.
+        AppLauncher publishes this as the ``/isaaclab/has_gui`` setting during initialization,
+        so the value is ``False`` before any launcher has run in the process.
+        """
+        return bool(get_settings_manager().get("/isaaclab/has_gui"))
 
     @staticmethod
     def _fuse_kit_args(argv: list[str]) -> list[str]:
@@ -476,11 +522,12 @@ class AppLauncher:
             parser._option_string_actions.pop("-h")
             parser._option_string_actions.pop("--help")
 
-        # Parse known args for potential name collisions/type mismatches
-        # between the config fields SimulationApp expects and the ArgParse
-        # arguments that the user passed.
-        known, _ = parser.parse_known_args()
-        config = vars(known)
+        # Collect the declared arguments for potential name collisions/type mismatches between the
+        # config fields SimulationApp expects and the ArgParse arguments that the user added. Read
+        # from the parser rather than by parsing the command line: parsing exits the process when a
+        # required argument is missing, which is the case for any script with required positionals
+        # invoked with '--help', and the launcher arguments would never reach the help output.
+        config = {action.dest: action.default for action in parser._actions if action.dest != argparse.SUPPRESS}
         if len(config) == 0:
             logger.warning(
                 "[WARN][AppLauncher]: There are no arguments attached to the ArgumentParser object."
@@ -605,6 +652,10 @@ class AppLauncher:
     Internal functions.
     """
 
+    # Set by :meth:`_resolve_xr_settings`. Defaulted here so :meth:`_resolve_headless_settings`
+    # stays independent of resolver call order and of whether XR was resolved at all.
+    _xr_implies_headless: bool = False
+
     _APPLAUNCHER_CFG_INFO: dict[str, tuple[list[type], Any]] = {
         "headless": ([bool], False),
         "livestream": ([int], -1),
@@ -649,6 +700,7 @@ class AppLauncher:
         "open_usd": [str, type(None)],
         "livesync_usd": [str, type(None)],
         "fast_shutdown": [bool],
+        "limit_cpu_threads": [int],
         "experience": [str],
     }
     """A dictionary containing the type of arguments passed to SimulationApp.
@@ -836,7 +888,15 @@ class AppLauncher:
 
         # Resolve headless from visualizer intent when livestream is disabled.
         if self._livestream == 0:
-            if self._cli_visualizer_explicit:
+            if self._xr_implies_headless:
+                # XR without an explicit windowed visualizer: no viewport to start the session from.
+                if not self._headless:
+                    logger.info(
+                        "XR is enabled without an explicit windowed visualizer, so running headless. "
+                        "To also open a local viewport, pass '--viz <names>' (for example '--viz kit')."
+                    )
+                self._headless = True
+            elif self._cli_visualizer_explicit:
                 # Explicit CLI selection controls headless: only Kit implies non-headless.
                 requested_visualizers = set(self._cli_visualizer_types)
                 if self._cli_visualizer_disable_all or "kit" not in requested_visualizers:
@@ -927,20 +987,28 @@ class AppLauncher:
         else:
             self._xr = bool(xr_env)
 
-        # Determine whether XR should auto-inject a KitVisualizer.
-        # When XR is enabled but no Kit visualizer was explicitly requested via
-        # CLI, we auto-inject one so that app.update() and forward() are pumped
-        # each frame -- the XR runtime needs both to receive updated hand/joint
-        # transforms.
+        # Whether XR alone should force headless. Without an explicit windowed visualizer there
+        # is no viewport to start the session from, so a window would serve no purpose. This only
+        # adds to the headless decision below; it never makes a run non-headless.
         if self._xr:
             has_explicit_kit = self._cli_visualizer_explicit and "kit" in set(self._cli_visualizer_types)
-            self._xr_auto_start = not has_explicit_kit
+            self._xr_implies_headless = not has_explicit_kit
         else:
-            self._xr_auto_start = False
+            self._xr_implies_headless = False
 
     def _resolve_viewport_settings(self, launcher_args: dict):
         """Resolve viewport related settings."""
         self._video_enabled = bool(launcher_args.get("video", False))
+        if self._video_enabled and any(
+            importlib.util.find_spec(package) is None for package in ("moviepy", "imageio_ffmpeg")
+        ):
+            raise ModuleNotFoundError(
+                "Video recording with `--video` requires MoviePy and its imageio-ffmpeg backend, "
+                "which are not installed by default. "
+                "Run uv commands with `uv run --extra video ...`, or install MoviePy into the "
+                'legacy environment with `./isaaclab.sh -p -m pip install "moviepy>=1.0.3,<2.0.0.dev0"` '
+                "(`isaaclab.bat -p -m pip install ...` on Windows), and retry."
+            )
         # Check if we can disable the viewport to improve performance
         #   This should only happen if we are running headless and do not require livestreaming or video recording
         #   This is different from offscreen_render because this only affects the default viewport and
@@ -1154,6 +1222,11 @@ class AppLauncher:
             if not any(arg.partition("=")[0] == setting for arg in sys.argv + self._kit_args):
                 self._kit_args.append(argument)
 
+        argument = "--/exts/isaacsim.core.simulation_manager/enable_default_callbacks=false"
+        setting = argument.partition("=")[0]
+        if not any(arg.partition("=")[0] == setting for arg in sys.argv + self._kit_args):
+            self._kit_args.append(argument)
+
         sys.argv += self._kit_args
 
     def _create_app(self):
@@ -1232,10 +1305,12 @@ class AppLauncher:
 
         # set setting to indicate XR mode is enabled
         settings.set_bool("/isaaclab/xr/enabled", self._xr)
-        # set setting to indicate XR auto-start mode -- when running headless
-        # (no Kit GUI) the AR profile must be enabled programmatically so that
-        # the OpenXR session starts without user interaction
-        settings.set_bool("/isaaclab/xr/auto_start", self._headless and self._xr)
+        # set setting to indicate XR auto-start mode -- with no window to start the
+        # session from, the AR profile must be enabled programmatically so that the
+        # OpenXR session starts without user interaction. This must key off the
+        # resolved headless state: HEADLESS=1 and livestreaming both run windowless
+        # even when a Kit visualizer was explicitly requested.
+        settings.set_bool("/isaaclab/xr/auto_start", self._xr and self._headless)
         # set setting to indicate video recording mode
         settings.set_bool("/isaaclab/video/enabled", self._video_enabled)
 
