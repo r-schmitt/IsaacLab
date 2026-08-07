@@ -5,11 +5,12 @@ Changed
   PhysX and OvPhysX scene construction no longer slows down disproportionately as the number of
   environments grows. The authored USD is byte-for-byte identical, so simulation behavior is
   unchanged.
-* Skipped authoring per-environment ``PhysicsCollisionGroup`` prims in
-  :meth:`~isaaclab.scene.InteractiveScene.filter_collisions` for physics backends that filter
-  cross-environment collisions natively (reported via the new
-  :meth:`~isaaclab.physics.PhysicsManager.filters_cross_env_collisions_natively` hook), removing the
-  per-environment collision-group parsing that dominated simulation start at high environment counts.
+* Added a :meth:`~isaaclab.physics.PhysicsManager.filters_cross_env_collisions_natively` hook that lets
+  a physics backend opt out of per-environment ``PhysicsCollisionGroup`` authoring in
+  :meth:`~isaaclab.scene.InteractiveScene.filter_collisions`, removing the per-environment
+  collision-group parsing that dominates simulation start at high environment counts. The base default
+  is ``False`` (author the groups); backends enable it only when they filter cross-environment
+  collisions natively and do not depend on the collision-group authoring for clone materialization.
 
 Added
 ^^^^^
