@@ -57,9 +57,12 @@ __all__ = [
     "configclass",
     "resolve_cfg_presets",
     "checked_apply",
+    "nsys_capture_range",
+    "NSYS_CAPTURE_ENV_VAR",
 ]
 
 from .timer import Timer
+from .profiling import nsys_capture_range, NSYS_CAPTURE_ENV_VAR
 from .array import TensorData, TENSOR_TYPES, TENSOR_TYPE_CONVERSIONS, convert_to_torch
 from .buffers import CircularBuffer, DelayBuffer, TimestampedBuffer, TimestampedBufferWarp
 from .dict import (

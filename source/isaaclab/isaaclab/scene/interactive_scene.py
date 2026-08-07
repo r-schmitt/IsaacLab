@@ -202,7 +202,9 @@ class InteractiveScene:
 
         self._aggregate_scene_data_requirements(requested_viz_types)
 
-        # Collision filtering is PhysX-only (matches both physx and ovphysx).
+        # Collision filtering is PhysX-only (matches both physx and ovphysx). Backends that filter
+        # cross-environment collisions natively short-circuit inside filter_collisions() itself, so
+        # both this automatic call and the manual calls Direct tasks make in _setup_scene() are covered.
         if self.cfg.filter_collisions and "physx" in self.physics_backend and self._is_scene_setup_from_cfg():
             self.filter_collisions(self._global_prim_paths)
 
@@ -316,6 +318,13 @@ class InteractiveScene:
             global_prim_paths: A list of global prim paths to enable collisions with.
                 Defaults to None, in which case no global prim paths are considered.
         """
+        # Backends that assign a PhysX-native environment id to each clone (e.g. OvPhysX) filter
+        # cross-environment collisions in the broadphase, so the per-environment collision groups
+        # authored below would be redundant and their parsing dominates simulation start at high
+        # environment counts. Skip authoring them and let the native env-id filter do the work.
+        if self.sim.physics_manager.filters_cross_env_collisions_natively():
+            return
+
         # validate paths in global prim paths
         if global_prim_paths is None:
             global_prim_paths = []

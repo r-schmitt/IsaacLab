@@ -87,6 +87,15 @@ class Timer(ContextDecorator):
     enable_display_output: ClassVar[bool] = True
     """Whether to enable the display output."""
 
+    enable_nsys_ranges: ClassVar[bool] = True
+    """Whether named timers emit an nsys/NVTX range around the timed region.
+
+    Named timers annotate their region via :func:`~isaaclab.utils.profiling.nsys_region_enter`
+    so that phases like scene creation and simulation start appear as swim-lanes in an nsys
+    profile (and can trigger a ``cudaProfilerApi`` capture window). The annotation is a no-op
+    when CUDA is unavailable; set this to ``False`` to disable it entirely.
+    """
+
     _UNIT_MULTIPLIERS: ClassVar[dict[str, float]] = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
     """Mapping from time unit string to multiplier (seconds -> unit)."""
 
@@ -113,6 +122,7 @@ class Timer(ContextDecorator):
         self._stop_time = None
         self._elapsed_time = None
         self._enable = enable if Timer.enable else False
+        self._nsys_token = None
 
         if time_unit not in Timer._UNIT_MULTIPLIERS:
             raise ValueError(f"Invalid time_unit, {time_unit} is not in {list(Timer._UNIT_MULTIPLIERS)}")
@@ -167,6 +177,13 @@ class Timer(ContextDecorator):
         if self._start_time is not None:
             raise TimerError("Timer is running. Use .stop() to stop it")
 
+        # Named timers open an nsys/NVTX range around the timed region so profiles can
+        # attribute (and optionally capture) startup phases such as scene creation.
+        if self._name is not None and Timer.enable_nsys_ranges:
+            from isaaclab.utils.profiling import nsys_region_enter  # noqa: PLC0415
+
+            self._nsys_token = nsys_region_enter(self._name)
+
         self._start_time = time.perf_counter()
 
     def stop(self):
@@ -184,6 +201,13 @@ class Timer(ContextDecorator):
         self._stop_time = time.perf_counter()
         self._elapsed_time = self._stop_time - self._start_time
         self._start_time = None
+
+        # Close the nsys/NVTX range opened in start() (also ends any capture window).
+        if self._nsys_token is not None:
+            from isaaclab.utils.profiling import nsys_region_exit  # noqa: PLC0415
+
+            nsys_region_exit(self._nsys_token)
+            self._nsys_token = None
 
         if self._name is not None:
             self._update_welford(self._elapsed_time)
