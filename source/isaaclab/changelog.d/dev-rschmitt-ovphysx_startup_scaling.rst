@@ -5,3 +5,16 @@ Changed
   PhysX and OvPhysX scene construction no longer slows down disproportionately as the number of
   environments grows. The authored USD is byte-for-byte identical, so simulation behavior is
   unchanged.
+* Skipped authoring per-environment ``PhysicsCollisionGroup`` prims in
+  :meth:`~isaaclab.scene.InteractiveScene.filter_collisions` for physics backends that filter
+  cross-environment collisions natively (reported via the new
+  :meth:`~isaaclab.physics.PhysicsManager.filters_cross_env_collisions_natively` hook), removing the
+  per-environment collision-group parsing that dominated simulation start at high environment counts.
+
+Added
+^^^^^
+
+* Added :func:`~isaaclab.utils.nsys_capture_range` and the ``ISAACLAB_NSYS_CAPTURE`` environment
+  variable to bracket named code regions with NVTX ranges and an optional ``cudaProfilerApi`` capture
+  window. Named :class:`~isaaclab.utils.Timer` regions (e.g. scene creation and simulation start) now
+  emit these ranges so an nsys profile can attribute and capture startup phases.

@@ -393,6 +393,21 @@ class OvPhysxManager(PhysicsManager):
         cls._requires_full_stage = True
 
     @classmethod
+    def filters_cross_env_collisions_natively(cls) -> bool:
+        """Whether OvPhysX filters cross-environment collisions with native environment ids.
+
+        OvPhysX assigns each cloned actor a PhysX environment id (authored as
+        ``physxScene:envIdInBoundsBitCount`` in :class:`~isaaclab_ovphysx.cloner.OvPhysxReplicateContext`),
+        so the broadphase filters cross-environment pairs directly and the per-environment USD collision
+        groups are redundant. Controlled by
+        :attr:`~isaaclab_ovphysx.physics.OvPhysxCfg.filter_env_collisions_with_env_ids`.
+
+        Returns:
+            Whether env-id-based filtering is enabled for this run.
+        """
+        return bool(getattr(cls._cfg, "filter_env_collisions_with_env_ids", True))
+
+    @classmethod
     def fix_articulation_root(cls, articulation_prim: Any, stage: Any = None) -> Any:
         """Fix and normalize an articulation root for the OVPhysX parser."""
         root = super().fix_articulation_root(articulation_prim, stage)

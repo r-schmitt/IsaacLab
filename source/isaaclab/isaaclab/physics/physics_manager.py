@@ -108,6 +108,25 @@ class PhysicsManager(ABC):
         return True
 
     @classmethod
+    def filters_cross_env_collisions_natively(cls) -> bool:
+        """Whether this backend filters collisions across cloned environments without USD collision groups.
+
+        Cloning normally authors one ``PhysicsCollisionGroup`` per environment (via
+        :meth:`~isaaclab.scene.InteractiveScene.filter_collisions`) so that clones do not collide
+        across environments. Parsing those groups at simulation start scales poorly with the
+        environment count. Backends that instead assign a PhysX-native environment id to each cloned
+        actor (so the broadphase filters cross-environment pairs directly) return ``True`` here; the
+        scene then skips the per-environment collision-group authoring entirely.
+
+        The base default is ``False`` (rely on USD collision groups). Backends with native
+        environment-id filtering override this to ``True``.
+
+        Returns:
+            Whether the backend filters cross-environment collisions natively.
+        """
+        return False
+
+    @classmethod
     def fix_articulation_root(cls, articulation_prim: Any, stage: Any = None) -> Any:
         """Ensure that an articulation root has one enabled world fixed joint.
 

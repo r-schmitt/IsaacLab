@@ -22,6 +22,19 @@ class OvPhysxCfg(PhysicsCfg):
 
     class_type = "{DIR}.ovphysx_manager:OvPhysxManager"
 
+    filter_env_collisions_with_env_ids: bool = True
+    """Filter cross-environment collisions with PhysX-native environment ids instead of USD collision groups.
+
+    When ``True`` (default), the clone pipeline relies on the PhysX environment-id broadphase filter
+    (authored as ``physxScene:envIdInBoundsBitCount`` during replication) to keep cloned environments
+    from colliding with each other, and :class:`~isaaclab.scene.InteractiveScene` skips authoring one
+    ``PhysicsCollisionGroup`` per environment. This removes the per-environment collision-group parsing
+    that dominates simulation start at high environment counts.
+
+    Set to ``False`` to restore the legacy behavior of authoring per-environment collision groups
+    (useful for A/B comparison or heterogeneous setups the env-id filter does not yet cover).
+    """
+
     enable_enhanced_determinism: bool = False
     """Enable/disable improved determinism at the expense of performance. Defaults to False.
 

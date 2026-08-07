@@ -68,6 +68,40 @@ Flags:
 - ``--python-functions-trace=...`` - the function annotations file; ships with Isaac Lab.
 - ``-o my_profile`` - output path; nsys appends ``.nsys-rep``.
 
+Capturing a Specific Phase (Capture Range)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default ``nsys profile`` records the whole run. For a long or memory-heavy run you often want to
+capture only one phase — for example scene construction or simulation start, which can dominate
+startup at high environment counts. Isaac Lab wraps named timing regions (via
+:class:`~isaaclab.utils.Timer`) in NVTX ranges and, on demand, a ``cudaProfilerApi`` capture window,
+so nsys can start and stop recording around exactly that region.
+
+The two startup phases exposed this way are ``scene_creation`` (``gym.make`` scene construction) and
+``simulation_start`` (the first ``sim.reset()`` that initializes physics). To capture only simulation
+start, list the region(s) in the ``ISAACLAB_NSYS_CAPTURE`` environment variable and run nsys with
+``--capture-range=cudaProfilerApi``:
+
+.. code-block:: bash
+
+   ISAACLAB_NSYS_CAPTURE=simulation_start nsys profile \
+       -t nvtx,cuda \
+       --capture-range=cudaProfilerApi \
+       --capture-range-end=stop \
+       --python-functions-trace=scripts/benchmarks/nsys_trace.json \
+       -o startup_profile \
+       uv run isaaclab train --rl_library rsl_rl \
+           --task=Isaac-Cartpole \
+           --max_iterations=1
+
+Notes:
+
+- Comma-separate multiple regions, e.g. ``ISAACLAB_NSYS_CAPTURE=scene_creation,simulation_start``.
+- Without ``ISAACLAB_NSYS_CAPTURE`` the regions still emit NVTX ranges, so a full-capture profile
+  shows them as swim-lanes; the env var only gates the ``cudaProfilerApi`` start/stop window.
+- Alternatively key the capture on the NVTX range with
+  ``--capture-range=nvtx --nvtx-capture=simulation_start``.
+
 Reading the Resulting Profile
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
