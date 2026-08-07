@@ -400,15 +400,12 @@ class OvPhysxManager(PhysicsManager):
         ``physxScene:envIdInBoundsBitCount`` in :class:`~isaaclab_ovphysx.cloner.OvPhysxReplicateContext`),
         so the broadphase filters cross-environment pairs directly and the per-environment USD collision
         groups are redundant. Controlled by
-        :attr:`~isaaclab_ovphysx.physics.OvPhysxCfg.filter_env_collisions_with_env_ids`, which defaults to
-        ``False`` because skipping the collision-group authoring currently also suppresses the lazy
-        materialization of per-environment USD clones that USD-reading sensors (camera, ray caster,
-        contact) depend on.
+        :attr:`~isaaclab_ovphysx.physics.OvPhysxCfg.filter_env_collisions_with_env_ids`.
 
         Returns:
             Whether env-id-based filtering is enabled for this run.
         """
-        return bool(getattr(cls._cfg, "filter_env_collisions_with_env_ids", False))
+        return bool(getattr(cls._cfg, "filter_env_collisions_with_env_ids", True))
 
     @classmethod
     def fix_articulation_root(cls, articulation_prim: Any, stage: Any = None) -> Any:

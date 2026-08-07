@@ -6,11 +6,11 @@ Changed
   environments grows. The authored USD is byte-for-byte identical, so simulation behavior is
   unchanged.
 * Added a :meth:`~isaaclab.physics.PhysicsManager.filters_cross_env_collisions_natively` hook that lets
-  a physics backend opt out of per-environment ``PhysicsCollisionGroup`` authoring in
+  a physics backend skip per-environment ``PhysicsCollisionGroup`` authoring in
   :meth:`~isaaclab.scene.InteractiveScene.filter_collisions`, removing the per-environment
   collision-group parsing that dominates simulation start at high environment counts. The base default
-  is ``False`` (author the groups); backends enable it only when they filter cross-environment
-  collisions natively and do not depend on the collision-group authoring for clone materialization.
+  is ``False`` (author the groups); backends that filter cross-environment collisions natively override
+  it to ``True``.
 
 Added
 ^^^^^
