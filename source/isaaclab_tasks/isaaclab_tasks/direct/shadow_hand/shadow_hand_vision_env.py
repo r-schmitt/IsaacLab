@@ -30,12 +30,12 @@ class ShadowHandVisionEnvCfg(ShadowHandEnvCfg):
     tiled_camera: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
         offset=TiledCameraCfg.OffsetCfg(pos=(0, -0.35, 1.0), rot=(0.7071, 0.0, 0.7071, 0.0), convention="world"),
-        data_types=["rgb", "depth", "semantic_segmentation"],
+        data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 20.0)
         ),
-        width=120,
-        height=120,
+        width=64,
+        height=64,
     )
     feature_extractor = FeatureExtractorCfg()
 
@@ -58,7 +58,13 @@ class ShadowHandVisionEnv(InHandManipulationEnv):
     def __init__(self, cfg: ShadowHandVisionEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         # Use the log directory from the configuration
-        self.feature_extractor = FeatureExtractor(self.cfg.feature_extractor, self.device, self.cfg.log_dir)
+        self.feature_extractor = FeatureExtractor(
+            self.cfg.feature_extractor,
+            self.device,
+            self.cfg.log_dir,
+            height=self.cfg.tiled_camera.height,
+            width=self.cfg.tiled_camera.width,
+        )
         # hide goal cubes
         self.goal_pos[:, :] = torch.tensor([-0.2, 0.1, 0.6], device=self.device)
         # keypoints buffer
@@ -89,8 +95,6 @@ class ShadowHandVisionEnv(InHandManipulationEnv):
         # train CNN to regress on keypoint positions
         pose_loss, embeddings = self.feature_extractor.step(
             self._tiled_camera.data.output["rgb"],
-            self._tiled_camera.data.output["depth"],
-            self._tiled_camera.data.output["semantic_segmentation"][..., :3],
             object_pose,
         )
 
