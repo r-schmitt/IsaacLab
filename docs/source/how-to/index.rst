@@ -174,6 +174,18 @@ Omniverse Physics.
     simulation_performance
 
 
+Profiling with Nsight Systems
+-----------------------------
+
+This guide explains how to capture CPU/GPU profiles of Isaac Lab runs with NVIDIA Nsight
+Systems (nsys), including the trace-annotation file that produces per-domain swim-lanes.
+
+.. toctree::
+    :maxdepth: 1
+
+    profile_with_nsys
+
+
 Optimize Stage Creation
 -----------------------
 
