@@ -111,6 +111,10 @@ def _make_renderer_without_backend(device: str = "cpu") -> tuple[OVRTXRenderer, 
     # this module is testing.
     renderer._cable_points_binding = None
     renderer._cable_segment_counts = []
+    # Likewise set here because __init__ is bypassed: the ovstage write sites defer their operations
+    # into _pending_writes and take their producer-ordering events from _write_events.
+    renderer._pending_writes = []
+    renderer._write_events = {}
     renderer._use_ovstage = False
     return renderer, renderer._renderer
 
@@ -568,20 +572,21 @@ def test_write_particle_q_slices_ovstage_passes_device_slices_zero_copy():
 
     def _write(query, attribute, **kwargs):
         writes.append({"query": query, "attribute": attribute, **kwargs})
-        return SimpleNamespace(wait=lambda: None)
+        return SimpleNamespace(ok=True, op_id=1, wait=lambda: None)
 
     renderer._stage = SimpleNamespace(write_attribute=_write)
     renderer._current_ordinal = 7
     renderer._warp_device = wp.get_device("cuda:0")
 
-    renderer._write_particle_q_slices_ovstage("points_query", particle_q, [1], [3])
+    renderer._write_particle_q_slices_ovstage("points_query", particle_q, [1], [3], "deformable_points")
 
     assert len(writes) == 1
     assert writes[0]["attribute"] == "points"
     assert writes[0]["is_array"] is True
-    # The slices alias ``particle_q``, so ovstage is handed the producing Warp stream to order its
-    # read against, rather than the caller blocking the host on a device synchronize.
-    assert writes[0]["cuda_stream"] == wp.get_stream("cuda:0").cuda_stream
+    # The slices alias ``particle_q``, so ovstage is given an event recorded after the producing
+    # kernels to wait on, rather than the whole Warp stream to drain or a host device synchronize.
+    assert writes[0]["cuda_event"] == renderer._write_events["deformable_points"].cuda_event
+    assert "cuda_stream" not in writes[0]
     tensors = writes[0]["tensors"]
     assert len(tensors) == 1
     # A zero-copy device view: the descriptor points straight at the slice's own CUDA buffer with
@@ -590,6 +595,53 @@ def test_write_particle_q_slices_ovstage_passes_device_slices_zero_copy():
     assert tensors[0].data == particle_q[1:4].ptr
     assert tensors[0].shape_tuple == (3,)
     assert tensors[0].dtype.lanes == 3
+
+
+def test_ovstage_per_frame_writes_complete_at_the_barrier_not_individually():
+    """A per-frame ovstage write is never waited on its own; the ordinal barrier completes it.
+
+    ``advance_write_floor(N)`` is already ordered after every write at an ordinal ``<= N``, so
+    waiting per write would block the host for a guarantee the barrier gives once. The operations
+    must still outlive the barrier, because each one is its tensors' only keepalive.
+    """
+    renderer, _backend = _make_renderer_without_backend()
+    particle_q = wp.array([wp.vec3f(1.0, 2.0, 3.0)], dtype=wp.vec3f, device="cpu")
+    waited: list[int] = []
+    released: list[int] = []
+
+    def _write(query, attribute, **kwargs):  # noqa: ARG001
+        op_id = len(renderer._pending_writes) + 1
+        return SimpleNamespace(ok=True, op_id=op_id, wait=lambda: waited.append(op_id))
+
+    renderer._stage = SimpleNamespace(write_attribute=_write, release_op=released.append)
+    renderer._current_ordinal = 3
+    # A real event needs a CUDA device. Pre-seeding one keeps this test about the deferral contract;
+    # the recorded-event wiring is covered by the CUDA-gated slice test above.
+    event = SimpleNamespace(cuda_event=7)
+    renderer._write_events = {"particle_points": event}
+    renderer._warp_device = SimpleNamespace(stream=SimpleNamespace(record_event=lambda _event: event))
+
+    renderer._write_particle_q_slices_ovstage("points_query", particle_q, [0], [1], "particle_points")
+
+    assert waited == [], "the write was waited individually instead of being deferred to the barrier"
+    assert len(renderer._pending_writes) == 1, "the operation must be retained to keep its tensors alive"
+
+    renderer._release_deferred_writes_ovstage()
+
+    assert waited == [], "the barrier already guarantees completion, so no extra host wait is needed"
+    assert released == [1], "the deferred operation's tracking state must be released after the barrier"
+    assert renderer._pending_writes == []
+
+
+def test_ovstage_rejected_write_raises_instead_of_deferring():
+    """A rejected enqueue never reaches the barrier, so it must surface at the call site."""
+    renderer, _backend = _make_renderer_without_backend()
+    rejected = SimpleNamespace(ok=False, op_id=0, error_message=lambda: "invalid ordinal")
+
+    with pytest.raises(RuntimeError, match="invalid ordinal"):
+        renderer._defer_write_ovstage(rejected)
+
+    assert renderer._pending_writes == []
 
 
 def test_update_transforms_writes_caller_owned_buffer(monkeypatch: pytest.MonkeyPatch):

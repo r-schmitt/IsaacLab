@@ -1753,11 +1753,14 @@ class OVRTXRenderer(BaseRenderer):
     # ---------------------------------------------------------------------------
     # ovstage implementation
     #
+    # Per-frame writes are deferred rather than waited: see :meth:`_defer_write_ovstage` and the
+    # barrier in :meth:`_render_ovstage`. Init-time writes still wait individually, since they are
+    # one-off and their ordering is what the following setup step depends on.
+    #
     # Follow-up:
-    # - Experiment with dropping the per-frame ``.wait()`` calls. ``advance_write_floor(N).wait()`` in
-    #   :meth:`_render_ovstage` already bars all writes at ordinals <= N, so accumulate the
-    #   ``Operation`` objects and ``stage.release_op(op.op_id)`` after it. They must outlive the
-    #   barrier — an ``Operation`` is its buffer's only keepalive. Saves caller-side blocking only.
+    # - Batch the same-query init-time column pairs (``omni:resetXformStack`` + ``omni:xform``)
+    #   into single ``stage.write_attributes`` calls to cut startup ops and waits. That slot takes
+    #   one query handle, so it cannot batch the per-frame writes, which each target their own query.
     # ---------------------------------------------------------------------------
 
     def _init_fields_ovstage(self) -> None:
@@ -1777,6 +1780,11 @@ class OVRTXRenderer(BaseRenderer):
         self._cable_paths_list = None
         # DLTensor descriptors aliasing ``_cable_point_slices``; rebuilt only when cables rebind.
         self._cable_point_tensors: list = []
+        # Per-frame writes awaiting the ordinal barrier in :meth:`_render_ovstage`. An ``Operation``
+        # is its tensors' only keepalive, so these must outlive that barrier.
+        self._pending_writes: list = []
+        # One reusable event per write site. See :meth:`_write_event_ovstage`.
+        self._write_events: dict[str, wp.Event] = {}
 
     def _initialize_from_spec_ovstage(self, spec: CameraRenderSpec) -> None:
         """Initialize the OVRTX renderer with internal environment cloning (ovstage path).
@@ -2212,6 +2220,59 @@ class OVRTXRenderer(BaseRenderer):
         if self._particle_points_query is None:
             raise RuntimeError("Failed to create OVRTX particle point bindings")
 
+    def _write_event_ovstage(self, site: str) -> wp.Event:
+        """Record and return the event ordering one write site's producers against its ovstage write.
+
+        The event is recorded on the renderer's Warp stream, so it stands for every kernel enqueued
+        there up to this point — the same coverage the ``cuda_stream`` handoff had. The difference is
+        how ovstage consumes it: ``cuda_sync.wait_event`` is a cross-stream dependency on this one
+        point, where ``cuda_sync.stream`` drains all work queued on the stream.
+
+        Each site keeps its own event. A shared one would be re-recorded by a later site before an
+        earlier site's write had consumed it, widening that write's wait to unrelated work.
+
+        Args:
+            site: Stable name of the calling write site.
+
+        Returns:
+            The site's event, recorded at the current point in the Warp stream.
+        """
+        event = self._write_events.get(site)
+        if event is None:
+            event = wp.Event(device=self._device)
+            self._write_events[site] = event
+        return self._warp_device.stream.record_event(event)
+
+    def _defer_write_ovstage(self, operation: Any) -> None:
+        """Hold a per-frame write until the ordinal barrier in :meth:`_render_ovstage` covers it.
+
+        ``advance_write_floor(N)`` is ordered after every write at an ordinal ``<= N``, so waiting on
+        each write individually blocks the host for a guarantee the barrier already gives.
+
+        A rejected enqueue never reaches the barrier, so its status is checked here. Failures during
+        execution stay observable through the barrier's own wait, which depends on the writes it
+        covers.
+
+        Args:
+            operation: Enqueued write to keep alive until the barrier completes.
+
+        Raises:
+            RuntimeError: If ovstage rejected the enqueue.
+        """
+        if not operation.ok:
+            raise RuntimeError(f"ovstage rejected an attribute write: {operation.error_message()}")
+        self._pending_writes.append(operation)
+
+    def _release_deferred_writes_ovstage(self) -> None:
+        """Release the deferred writes the ordinal barrier has just completed.
+
+        Releasing rather than waiting drops each op's tracking state and its tensor keepalives
+        without blocking the host a second time for work already known to be done.
+        """
+        operations, self._pending_writes = self._pending_writes, []
+        for operation in operations:
+            self._stage.release_op(operation.op_id)
+
     def _update_transforms_ovstage(self) -> None:
         if self._object_xform_query is None or self._object_newton_indices is None or self._object_scales is None:
             return
@@ -2236,22 +2297,21 @@ class OVRTXRenderer(BaseRenderer):
             inputs=[object_transforms, self._object_newton_indices, body_q, self._object_scales],
             device=self._device,
         )
-        # The tensor is handed over zero-copy, so ovstage reads ``object_transforms`` in place and
-        # must not do so until the kernel above has landed. Passing the producing Warp stream as
-        # ``cuda_stream`` gives producer ordering: ovstage drains the work already queued on that
-        # stream before it touches the tensor. That replaces the device-wide
-        # ``wp.synchronize_device()`` with stream-scoped ordering and removes the host copy; it is
-        # not a nonblocking handoff, and the ``.wait()`` below can still block the calling thread.
-        # A GPU-side wait would need the event-based API instead.
-        self._stage.write_attribute(
-            self._object_xform_query,
-            "omni:xform",
-            ordinal=self._current_ordinal,
-            tensors=xform_tensor_from_warp(object_transforms),
-            is_array=False,
-            semantic=ovstage.AttributeSemantic.MATRIX,
-            cuda_stream=self._warp_device.stream.cuda_stream,
-        ).wait()
+        # ovstage copies ``object_transforms`` out of the Warp buffer, and must not read it until the
+        # kernel above has landed. The recorded event is a GPU-side wait on exactly that kernel, so
+        # the host neither copies the data nor blocks to order it; the barrier in
+        # :meth:`_render_ovstage` covers completion for the whole frame.
+        self._defer_write_ovstage(
+            self._stage.write_attribute(
+                self._object_xform_query,
+                "omni:xform",
+                ordinal=self._current_ordinal,
+                tensors=xform_tensor_from_warp(object_transforms),
+                is_array=False,
+                semantic=ovstage.AttributeSemantic.MATRIX,
+                cuda_event=self._write_event_ovstage("object_xform").cuda_event,
+            )
+        )
 
     def _update_geometries_ovstage(self) -> None:
         if self._deformable_points_query is not None or self._particle_points_query is not None:
@@ -2275,6 +2335,7 @@ class OVRTXRenderer(BaseRenderer):
                     particle_q,
                     self._deformable_particle_offsets,
                     self._deformable_particle_counts,
+                    "deformable_points",
                 )
 
             if self._particle_points_query is not None:
@@ -2283,6 +2344,7 @@ class OVRTXRenderer(BaseRenderer):
                     particle_q,
                     self._particle_visual_offsets,
                     self._particle_visual_counts,
+                    "particle_points",
                 )
 
         if self._cable_points_query is not None:
@@ -2294,55 +2356,58 @@ class OVRTXRenderer(BaseRenderer):
         particle_q: wp.array,
         particle_offsets: list[int],
         particle_counts: list[int],
+        site: str,
     ) -> None:
         """Write world-space ``particle_q`` slices into the ``points`` column of one ovstage query.
 
         Args:
             query: ovstage query selecting the prims whose ``points`` attribute is written.
             particle_q: Flat world-space particle positions [m], shape ``[total_particles]``,
-                dtype ``wp.vec3f``. Slices are passed zero-copy as CUDA DLTensors.
+                dtype ``wp.vec3f``. Slices are described as CUDA DLTensors for ovstage to copy from.
             particle_offsets: Start index of each prim's slice into :paramref:`particle_q`.
             particle_counts: Number of particles in each prim's slice.
+            site: Write-site name identifying this call's event; see :meth:`_write_event_ovstage`.
         """
         particle_slices = [
             points_tensor_from_warp(particle_q[particle_offset : particle_offset + particle_count])
             for particle_offset, particle_count in zip(particle_offsets, particle_counts, strict=True)
         ]
 
-        # The slices alias ``particle_q`` and are handed over zero-copy, so ovstage must not read
-        # them until the Warp kernels that wrote ``particle_q`` have finished. Passing the producing
-        # Warp stream as ``cuda_stream`` gives producer ordering: ovstage drains the work already
-        # queued on that stream before it touches the slices. That replaces the device-wide
-        # ``wp.synchronize_device()`` with stream-scoped ordering and removes the host copy; it is
-        # not a nonblocking handoff, and the ``.wait()`` below can still block the calling thread.
-        self._stage.write_attribute(
-            query,
-            "points",
-            ordinal=self._current_ordinal,
-            tensors=particle_slices,
-            is_array=True,
-            semantic=ovstage.AttributeSemantic.POINT,
-            cuda_stream=self._warp_device.stream.cuda_stream,
-        ).wait()
+        # The slices alias ``particle_q``, so ovstage must not read them until the Warp kernels that
+        # wrote it have finished. The recorded event is a GPU-side wait covering those kernels, which
+        # keeps both the data and the ordering off the host; the barrier in :meth:`_render_ovstage`
+        # covers completion for the whole frame.
+        self._defer_write_ovstage(
+            self._stage.write_attribute(
+                query,
+                "points",
+                ordinal=self._current_ordinal,
+                tensors=particle_slices,
+                is_array=True,
+                semantic=ovstage.AttributeSemantic.POINT,
+                cuda_event=self._write_event_ovstage(site).cuda_event,
+            )
+        )
 
     def _write_cable_points_ovstage(self) -> None:
         """Recompute world-space cable curve points on device and write them through ovstage."""
         self._compute_cable_points_world()
 
-        # The cached descriptors alias ``_cable_points`` and are handed over zero-copy, so ovstage
-        # must not read them until the kernel above has landed. Passing the producing Warp stream as
-        # ``cuda_stream`` gives producer ordering: ovstage drains the work already queued on that
-        # stream before it touches the slices. That keeps the handover off the host; it is not a
-        # nonblocking handoff, and the ``.wait()`` below can still block the calling thread.
-        self._stage.write_attribute(
-            self._cable_points_query,
-            "points",
-            ordinal=self._current_ordinal,
-            tensors=self._cable_point_tensors,
-            is_array=True,
-            semantic=ovstage.AttributeSemantic.POINT,
-            cuda_stream=self._warp_device.stream.cuda_stream,
-        ).wait()
+        # The cached descriptors alias ``_cable_points``, so ovstage must not read them until the
+        # kernel above has landed. The recorded event is a GPU-side wait on that kernel, keeping both
+        # the data and the ordering off the host; the barrier in :meth:`_render_ovstage` covers
+        # completion for the whole frame.
+        self._defer_write_ovstage(
+            self._stage.write_attribute(
+                self._cable_points_query,
+                "points",
+                ordinal=self._current_ordinal,
+                tensors=self._cable_point_tensors,
+                is_array=True,
+                semantic=ovstage.AttributeSemantic.POINT,
+                cuda_event=self._write_event_ovstage("cable_points").cuda_event,
+            )
+        )
 
     def _update_camera_ovstage(
         self,
@@ -2368,16 +2433,18 @@ class OVRTXRenderer(BaseRenderer):
             device=self._device,
         )
         if self._camera_xform_query is not None:
-            # Stream-ordered zero-copy handoff, as for the object transforms above.
-            self._stage.write_attribute(
-                self._camera_xform_query,
-                "omni:xform",
-                ordinal=self._current_ordinal,
-                tensors=xform_tensor_from_warp(camera_transforms),
-                is_array=False,
-                semantic=ovstage.AttributeSemantic.MATRIX,
-                cuda_stream=self._warp_device.stream.cuda_stream,
-            ).wait()
+            # Event-ordered, barrier-completed handoff, as for the object transforms above.
+            self._defer_write_ovstage(
+                self._stage.write_attribute(
+                    self._camera_xform_query,
+                    "omni:xform",
+                    ordinal=self._current_ordinal,
+                    tensors=xform_tensor_from_warp(camera_transforms),
+                    is_array=False,
+                    semantic=ovstage.AttributeSemantic.MATRIX,
+                    cuda_event=self._write_event_ovstage("camera_xform").cuda_event,
+                )
+            )
 
     def _render_ovstage(self, render_data: OVRTXRenderData) -> None:
         if not self._initialized_scene:
@@ -2391,6 +2458,9 @@ class OVRTXRenderer(BaseRenderer):
             if material_writer is not None:
                 material_writer.publish()
             self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
+            # Only on success: a failed barrier leaves completion unknown, and releasing an op that
+            # may still run would free tensors ovstage could read. Those stay for :meth:`close`.
+            self._release_deferred_writes_ovstage()
         finally:
             if material_writer is not None:
                 drain_errors = contextlib.nullcontext() if sys.exc_info()[0] is None else contextlib.suppress(Exception)
@@ -2438,6 +2508,18 @@ class OVRTXRenderer(BaseRenderer):
             except Exception as e:
                 if "destroyed" not in str(e).lower():
                     logger.warning("Error destroying %s path list: %s", name, e)
+
+        # Writes are normally released by the barrier in :meth:`_render_ovstage`; any left here were
+        # deferred past a failed barrier and may still be in flight. Wait before the queries they
+        # target and the buffers they alias go away.
+        operations, self._pending_writes = self._pending_writes, []
+        for operation in operations:
+            try:
+                operation.wait()
+            except Exception as e:
+                if "destroyed" not in str(e).lower():
+                    logger.warning("Error completing deferred write: %s", e)
+        self._write_events = {}
 
         _safe_release_query(self._camera_xform_query, "camera transforms")
         self._camera_xform_query = None
