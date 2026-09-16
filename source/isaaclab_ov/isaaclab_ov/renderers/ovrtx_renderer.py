@@ -72,6 +72,7 @@ from isaaclab.renderers import BaseRenderer, RenderBufferKind, RenderBufferSpec
 from isaaclab.sim import SimulationContext
 from isaaclab.utils.warp.warp_math import convert_camera_frame_orientation_convention_wp
 
+from isaaclab_ov.ovstage_compat import DEFER_PER_FRAME_WRITE_COMPLETION
 from isaaclab_ov.renderers.ovrtx_annotator_utils import (
     build_instance_id_to_labels_and_semantics,
     build_semantic_id_to_labels,
@@ -1753,9 +1754,10 @@ class OVRTXRenderer(BaseRenderer):
     # ---------------------------------------------------------------------------
     # ovstage implementation
     #
-    # Per-frame writes are deferred rather than waited: see :meth:`_defer_write_ovstage` and the
-    # barrier in :meth:`_render_ovstage`. Init-time writes still wait individually, since they are
-    # one-off and their ordering is what the following setup step depends on.
+    # How per-frame writes complete depends on the installed OVStage: see
+    # :meth:`_complete_per_frame_write_ovstage` and the barrier in :meth:`_render_ovstage`.
+    # Init-time writes always wait individually, since they are one-off and their ordering is what
+    # the following setup step depends on.
     #
     # Follow-up:
     # - Batch the same-query init-time column pairs (``omni:resetXformStack`` + ``omni:xform``)
@@ -2243,6 +2245,40 @@ class OVRTXRenderer(BaseRenderer):
             self._write_events[site] = event
         return self._warp_device.stream.record_event(event)
 
+    def _write_ordering_ovstage(self, site: str) -> dict[str, int]:
+        """Return the ``write_attribute`` argument handing one site's producers to ovstage.
+
+        The two forms pair with the two completion strategies in
+        :meth:`_complete_per_frame_write_ovstage`. A write completed at the barrier is ordered by a
+        recorded event, so ovstage waits on the producing kernels alone. A write waited on
+        individually is ordered by the Warp stream, which is what the stage drains before it reads.
+
+        Args:
+            site: Stable name of the calling write site.
+
+        Returns:
+            A single-entry mapping to splat into :meth:`ovstage.Stage.write_attribute`.
+        """
+        if DEFER_PER_FRAME_WRITE_COMPLETION:
+            return {"cuda_event": self._write_event_ovstage(site).cuda_event}
+        return {"cuda_stream": self._warp_device.stream.cuda_stream}
+
+    def _complete_per_frame_write_ovstage(self, operation: Any) -> None:
+        """Complete one per-frame write, either at the frame's barrier or before returning.
+
+        On OVStage 0.2 and later the write is held for the ordinal barrier in
+        :meth:`_render_ovstage`, which completes the frame's writes together. Older releases wait
+        here instead, because deferring costs time while the hierarchy is computed on the host; see
+        :func:`~isaaclab_ov.ovstage_compat.defers_per_frame_write_completion`.
+
+        Args:
+            operation: The enqueued write to complete.
+        """
+        if DEFER_PER_FRAME_WRITE_COMPLETION:
+            self._defer_write_ovstage(operation)
+            return
+        operation.wait()
+
     def _defer_write_ovstage(self, operation: Any) -> None:
         """Hold a per-frame write until the ordinal barrier in :meth:`_render_ovstage` covers it.
 
@@ -2298,10 +2334,9 @@ class OVRTXRenderer(BaseRenderer):
             device=self._device,
         )
         # ovstage copies ``object_transforms`` out of the Warp buffer, and must not read it until the
-        # kernel above has landed. The recorded event is a GPU-side wait on exactly that kernel, so
-        # the host neither copies the data nor blocks to order it; the barrier in
-        # :meth:`_render_ovstage` covers completion for the whole frame.
-        self._defer_write_ovstage(
+        # kernel above has landed. Ordering is handed over on the GPU rather than by a host copy or
+        # a host block; completion follows the installed OVStage's strategy.
+        self._complete_per_frame_write_ovstage(
             self._stage.write_attribute(
                 self._object_xform_query,
                 "omni:xform",
@@ -2309,7 +2344,7 @@ class OVRTXRenderer(BaseRenderer):
                 tensors=xform_tensor_from_warp(object_transforms),
                 is_array=False,
                 semantic=ovstage.AttributeSemantic.MATRIX,
-                cuda_event=self._write_event_ovstage("object_xform").cuda_event,
+                **self._write_ordering_ovstage("object_xform"),
             )
         )
 
@@ -2374,10 +2409,9 @@ class OVRTXRenderer(BaseRenderer):
         ]
 
         # The slices alias ``particle_q``, so ovstage must not read them until the Warp kernels that
-        # wrote it have finished. The recorded event is a GPU-side wait covering those kernels, which
-        # keeps both the data and the ordering off the host; the barrier in :meth:`_render_ovstage`
-        # covers completion for the whole frame.
-        self._defer_write_ovstage(
+        # wrote it have finished. Ordering is handed over on the GPU, keeping the data off the host;
+        # completion follows the installed OVStage's strategy.
+        self._complete_per_frame_write_ovstage(
             self._stage.write_attribute(
                 query,
                 "points",
@@ -2385,7 +2419,7 @@ class OVRTXRenderer(BaseRenderer):
                 tensors=particle_slices,
                 is_array=True,
                 semantic=ovstage.AttributeSemantic.POINT,
-                cuda_event=self._write_event_ovstage(site).cuda_event,
+                **self._write_ordering_ovstage(site),
             )
         )
 
@@ -2394,10 +2428,9 @@ class OVRTXRenderer(BaseRenderer):
         self._compute_cable_points_world()
 
         # The cached descriptors alias ``_cable_points``, so ovstage must not read them until the
-        # kernel above has landed. The recorded event is a GPU-side wait on that kernel, keeping both
-        # the data and the ordering off the host; the barrier in :meth:`_render_ovstage` covers
-        # completion for the whole frame.
-        self._defer_write_ovstage(
+        # kernel above has landed. Ordering is handed over on the GPU, keeping the data off the host;
+        # completion follows the installed OVStage's strategy.
+        self._complete_per_frame_write_ovstage(
             self._stage.write_attribute(
                 self._cable_points_query,
                 "points",
@@ -2405,7 +2438,7 @@ class OVRTXRenderer(BaseRenderer):
                 tensors=self._cable_point_tensors,
                 is_array=True,
                 semantic=ovstage.AttributeSemantic.POINT,
-                cuda_event=self._write_event_ovstage("cable_points").cuda_event,
+                **self._write_ordering_ovstage("cable_points"),
             )
         )
 
@@ -2433,8 +2466,8 @@ class OVRTXRenderer(BaseRenderer):
             device=self._device,
         )
         if self._camera_xform_query is not None:
-            # Event-ordered, barrier-completed handoff, as for the object transforms above.
-            self._defer_write_ovstage(
+            # Same GPU-side handoff and completion strategy as the object transforms above.
+            self._complete_per_frame_write_ovstage(
                 self._stage.write_attribute(
                     self._camera_xform_query,
                     "omni:xform",
@@ -2442,7 +2475,7 @@ class OVRTXRenderer(BaseRenderer):
                     tensors=xform_tensor_from_warp(camera_transforms),
                     is_array=False,
                     semantic=ovstage.AttributeSemantic.MATRIX,
-                    cuda_event=self._write_event_ovstage("camera_xform").cuda_event,
+                    **self._write_ordering_ovstage("camera_xform"),
                 )
             )
 

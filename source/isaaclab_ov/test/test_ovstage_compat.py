@@ -27,13 +27,17 @@ pytestmark = [
 
 if not _MISSING_MODULES:
     from isaaclab_ov.ovstage_compat import (  # noqa: E402
+        DEFER_PER_FRAME_WRITE_COMPLETION,
         HIERARCHY_COMPUTATION_MODEL,
+        defers_per_frame_write_completion,
         detect_ovstage_version,
         resolve_hierarchy_computation_model,
         supports_gpu_hierarchy_computation,
     )
 else:
+    DEFER_PER_FRAME_WRITE_COMPLETION = None
     HIERARCHY_COMPUTATION_MODEL = None
+    defers_per_frame_write_completion = None
     detect_ovstage_version = None
     resolve_hierarchy_computation_model = None
     supports_gpu_hierarchy_computation = None
@@ -84,9 +88,26 @@ def test_ovstage_02_uses_the_device_hierarchy_model(version: Version):
     assert resolve_hierarchy_computation_model(version) == "GPU_INCREMENTAL"
 
 
-def test_installed_model_matches_the_installed_version():
-    """The published name is baked from the installed OVStage version at import."""
-    assert HIERARCHY_COMPUTATION_MODEL == resolve_hierarchy_computation_model(detect_ovstage_version())
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        (None, False),
+        (Version("0.1.1.355824"), False),
+        (Version("0.2"), True),
+        (Version("0.2.0.377349"), True),
+    ],
+)
+def test_write_completion_follows_the_hierarchy_model(version: Version | None, expected: bool):
+    """Deferring completion only pays off once the hierarchy leaves the host, so the boundary is shared."""
+    assert defers_per_frame_write_completion(version) is expected
+    assert defers_per_frame_write_completion(version) is supports_gpu_hierarchy_computation(version)
+
+
+def test_installed_policies_match_the_installed_version():
+    """Both published values are baked from the installed OVStage version at import."""
+    version = detect_ovstage_version()
+    assert resolve_hierarchy_computation_model(version) == HIERARCHY_COMPUTATION_MODEL
+    assert DEFER_PER_FRAME_WRITE_COMPLETION is defers_per_frame_write_completion(version)
 
 
 @pytest.mark.skipif(importlib.util.find_spec("ovstage") is None, reason="requires optional module: ovstage")
@@ -121,7 +142,6 @@ def captured_stage_config(monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.skipif(importlib.util.find_spec("ovstage") is None, reason="requires optional module: ovstage")
 def test_create_ovstage_requests_the_selected_model(monkeypatch: pytest.MonkeyPatch, captured_stage_config: dict):
     import ovstage
-
     from isaaclab_ov import stage as stage_module
 
     monkeypatch.setattr(stage_module, "HIERARCHY_COMPUTATION_MODEL", "GPU_INCREMENTAL")
@@ -136,7 +156,6 @@ def test_create_ovstage_falls_back_to_the_host_model_for_an_unknown_name(
 ):
     """A model this ovstage does not carry must degrade to the host model, not fail the stage."""
     import ovstage
-
     from isaaclab_ov import stage as stage_module
 
     monkeypatch.setattr(stage_module, "HIERARCHY_COMPUTATION_MODEL", "MODEL_FROM_A_FUTURE_OVSTAGE")

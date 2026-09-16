@@ -555,8 +555,12 @@ def test_update_geometries_writes_one_slice_per_cable(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.skipif(not wp.get_cuda_device_count(), reason="requires a CUDA device")
-def test_write_particle_q_slices_ovstage_passes_device_slices_zero_copy():
+@pytest.mark.parametrize("defer_completion", [True, False], ids=["ovstage_02", "ovstage_01"])
+def test_write_particle_q_slices_ovstage_passes_device_slices_zero_copy(
+    monkeypatch: pytest.MonkeyPatch, defer_completion: bool
+):
     """The ovstage points write hands ``particle_q`` slices to ovstage as CUDA DLTensors, without a host copy."""
+    monkeypatch.setattr(ovrtx_renderer_module, "DEFER_PER_FRAME_WRITE_COMPLETION", defer_completion)
     renderer, _backend = _make_renderer_without_backend(device="cuda:0")
     particle_q = wp.array(
         [
@@ -583,10 +587,16 @@ def test_write_particle_q_slices_ovstage_passes_device_slices_zero_copy():
     assert len(writes) == 1
     assert writes[0]["attribute"] == "points"
     assert writes[0]["is_array"] is True
-    # The slices alias ``particle_q``, so ovstage is given an event recorded after the producing
-    # kernels to wait on, rather than the whole Warp stream to drain or a host device synchronize.
-    assert writes[0]["cuda_event"] == renderer._write_events["deformable_points"].cuda_event
-    assert "cuda_stream" not in writes[0]
+    # The slices alias ``particle_q``, so ovstage is always told to wait for the producing kernels
+    # rather than left to read the buffer early or forced through a host device synchronize. Which
+    # handle carries that dependency follows the completion strategy: an event covering just those
+    # kernels for a write the barrier completes, the Warp stream for one waited on in place.
+    if defer_completion:
+        assert writes[0]["cuda_event"] == renderer._write_events["deformable_points"].cuda_event
+        assert "cuda_stream" not in writes[0]
+    else:
+        assert writes[0]["cuda_stream"] == renderer._warp_device.stream.cuda_stream
+        assert "cuda_event" not in writes[0]
     tensors = writes[0]["tensors"]
     assert len(tensors) == 1
     # A zero-copy device view: the descriptor points straight at the slice's own CUDA buffer with
@@ -597,13 +607,14 @@ def test_write_particle_q_slices_ovstage_passes_device_slices_zero_copy():
     assert tensors[0].dtype.lanes == 3
 
 
-def test_ovstage_per_frame_writes_complete_at_the_barrier_not_individually():
-    """A per-frame ovstage write is never waited on its own; the ordinal barrier completes it.
+def test_ovstage_per_frame_writes_complete_at_the_barrier_not_individually(monkeypatch: pytest.MonkeyPatch):
+    """On OVStage 0.2 a per-frame write is never waited on its own; the ordinal barrier completes it.
 
     ``advance_write_floor(N)`` is already ordered after every write at an ordinal ``<= N``, so
     waiting per write would block the host for a guarantee the barrier gives once. The operations
     must still outlive the barrier, because each one is its tensors' only keepalive.
     """
+    monkeypatch.setattr(ovrtx_renderer_module, "DEFER_PER_FRAME_WRITE_COMPLETION", True)
     renderer, _backend = _make_renderer_without_backend()
     particle_q = wp.array([wp.vec3f(1.0, 2.0, 3.0)], dtype=wp.vec3f, device="cpu")
     waited: list[int] = []
@@ -619,7 +630,9 @@ def test_ovstage_per_frame_writes_complete_at_the_barrier_not_individually():
     # the recorded-event wiring is covered by the CUDA-gated slice test above.
     event = SimpleNamespace(cuda_event=7)
     renderer._write_events = {"particle_points": event}
-    renderer._warp_device = SimpleNamespace(stream=SimpleNamespace(record_event=lambda _event: event))
+    # Both ordering handles are stubbed, so picking the wrong one fails on the assertions below
+    # rather than on a missing attribute.
+    renderer._warp_device = SimpleNamespace(stream=SimpleNamespace(record_event=lambda _event: event, cuda_stream=1234))
 
     renderer._write_particle_q_slices_ovstage("points_query", particle_q, [0], [1], "particle_points")
 
@@ -631,6 +644,31 @@ def test_ovstage_per_frame_writes_complete_at_the_barrier_not_individually():
     assert waited == [], "the barrier already guarantees completion, so no extra host wait is needed"
     assert released == [1], "the deferred operation's tracking state must be released after the barrier"
     assert renderer._pending_writes == []
+
+
+def test_ovstage_01_per_frame_writes_are_waited_individually(monkeypatch: pytest.MonkeyPatch):
+    """Where the hierarchy is computed on the host, each per-frame write is waited on in place.
+
+    Deferring costs time under that model, so OVStage 0.1 keeps the per-write wait and leaves
+    nothing for the barrier to release.
+    """
+    monkeypatch.setattr(ovrtx_renderer_module, "DEFER_PER_FRAME_WRITE_COMPLETION", False)
+    renderer, _backend = _make_renderer_without_backend()
+    particle_q = wp.array([wp.vec3f(1.0, 2.0, 3.0)], dtype=wp.vec3f, device="cpu")
+    waited: list[int] = []
+
+    def _write(query, attribute, **kwargs):  # noqa: ARG001
+        return SimpleNamespace(ok=True, op_id=1, wait=lambda: waited.append(1))
+
+    renderer._stage = SimpleNamespace(write_attribute=_write)
+    renderer._current_ordinal = 3
+    renderer._warp_device = SimpleNamespace(stream=SimpleNamespace(cuda_stream=1234))
+
+    renderer._write_particle_q_slices_ovstage("points_query", particle_q, [0], [1], "particle_points")
+
+    assert waited == [1], "the write must be completed before returning when it is not deferred"
+    assert renderer._pending_writes == [], "a write already waited on must not also reach the barrier"
+    assert renderer._write_events == {}, "no event is recorded when the Warp stream carries ordering"
 
 
 def test_ovstage_rejected_write_raises_instead_of_deferring():

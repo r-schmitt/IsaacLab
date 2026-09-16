@@ -12,15 +12,19 @@ wherever it is available. ``GPU_INCREMENTAL`` leaves objects out of place on OVS
 and is corrected in 0.2, so the model is chosen from the installed version rather than
 hard-coded.
 
-The installed version cannot change while the process runs, so the model is resolved once
-at import and published as :data:`HIERARCHY_COMPUTATION_MODEL`.
+Where the hierarchy is computed also decides how the OVRTX ovstage path completes its
+per-frame writes, so both policies are published from here and share one version boundary.
+
+The installed version cannot change while the process runs, so both are resolved once at
+import and published as :data:`HIERARCHY_COMPUTATION_MODEL` and
+:data:`DEFER_PER_FRAME_WRITE_COMPLETION`.
 
 The published name is resolved against :class:`ovstage.HierarchyComputationModel` by the
 caller, which keeps this module free of an ``ovstage`` import and therefore importable
 wherever the version policy needs to be inspected or tested.
 
 The public extras stay pinned to ``ovstage==0.1.1.355824``; a missing or unparsable
-install keeps the OVStage 0.1 host model.
+install keeps the OVStage 0.1 behavior for both policies.
 """
 
 from __future__ import annotations
@@ -85,8 +89,30 @@ def resolve_hierarchy_computation_model(version: Version | None) -> str:
     return "CPU_INCREMENTAL"
 
 
+def defers_per_frame_write_completion(version: Version | None) -> bool:
+    """Return whether per-frame attribute writes should complete at the ordinal barrier.
+
+    Completing the frame's writes together at the barrier removes a host round-trip per write, but
+    it only pays off once the hierarchy is computed on the device. Under the host model, waiting on
+    each write overlaps ovstage's per-write hierarchy work with the caller's preparation of the next
+    write; deferring them serializes that work at the barrier with nothing left to overlap, which
+    measures slower. The boundary is therefore the same as
+    :func:`supports_gpu_hierarchy_computation`.
+
+    Args:
+        version: OVStage version to classify, or ``None`` when OVStage is unavailable.
+
+    Returns:
+        Whether ``version`` is OVStage 0.2 or newer.
+    """
+    return supports_gpu_hierarchy_computation(version)
+
+
 OVSTAGE_VERSION: Version | None = detect_ovstage_version()
 """Installed OVStage version, or ``None`` when it is unavailable or unparsable."""
 
 HIERARCHY_COMPUTATION_MODEL: str = resolve_hierarchy_computation_model(OVSTAGE_VERSION)
 """Name of the hierarchy computation model to request for the installed OVStage."""
+
+DEFER_PER_FRAME_WRITE_COMPLETION: bool = defers_per_frame_write_completion(OVSTAGE_VERSION)
+"""Whether per-frame ovstage writes complete at the ordinal barrier for the installed OVStage."""
