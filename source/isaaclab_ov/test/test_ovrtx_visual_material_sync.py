@@ -123,9 +123,6 @@ def _renderer(*, use_ovstage: bool = False):
         renderer._stage = _OvstageRecorder(events)
         renderer._stage_paths = _PathRecorder()
         renderer._current_ordinal = 7
-        # Per-frame writes are deferred into this list and released by the render barrier.
-        renderer._pending_writes = []
-        renderer._write_events = {}
     return renderer, events
 
 

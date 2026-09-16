@@ -611,10 +611,6 @@ def _make_ovstage_renderer_with_backend(events: list[str]) -> OVRTXRenderer:
     renderer._output_id_color_buffers = {"semantic_segmentation": object()}
     renderer._initialized_scene = True
     renderer._current_ordinal = 7
-    # Empty as they are after a frame whose barrier released its deferred writes; close() still
-    # inspects both, so __init__ bypassing this fixture must not leave them unset.
-    renderer._pending_writes = []
-    renderer._write_events = {}
     return renderer
 
 
