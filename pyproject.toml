@@ -175,9 +175,9 @@ rerun = [
 
 isaacsim = ["isaacsim[all,extscache]==6.1.0.0"]
 
-ov = ["ovphysx==0.5.11", "ovrtx==0.4.1.364340", "ovstage==0.1.1.355824"]
-ovphysx = ["ovphysx==0.5.11", "ovstage==0.1.1.355824"]
-ovrtx = ["ovrtx==0.4.1.364340", "ovstage==0.1.1.355824"]
+ov = ["ovphysx==0.5.11", "ovrtx==0.5.0.377615", "ovstage==0.2.0.377349"]
+ovphysx = ["ovphysx==0.5.11", "ovstage==0.2.0.377349"]
+ovrtx = ["ovrtx==0.5.0.377615", "ovstage==0.2.0.377349"]
 
 mimic = [
     "isaaclab-mimic",
@@ -225,8 +225,8 @@ torch = "2.11.0"
 torchvision = "0.26.0"
 torchaudio = "2.11.0"
 ovphysx = "0.5.11"
-ovrtx = "0.4.1.364340"
-ovstage = "0.1.1.355824"
+ovrtx = "0.5.0.377615"
+ovstage = "0.2.0.377349"
 warp = "1.17.0"
 
 [tool.ruff]
@@ -420,6 +420,10 @@ override-dependencies = [
     # ovphysx caps packaging at <24 and isaacsim-core pins ==26.0; both caps are
     # stricter than the code needs, so widening lets them resolve together at 26.0.
     "packaging>=20,<27",
+    # ovphysx 0.5.11 requires ovstage==0.1.1.355824 exactly, which would pin the whole
+    # environment to the 0.1 line. Benchmarking this branch needs ovstage 0.2 for the
+    # GPU hierarchy model, and ovphysx is not exercised here, so force the newer stage.
+    "ovstage==0.2.0.377349",
 ]
 python-preference = "only-managed"
 package = false

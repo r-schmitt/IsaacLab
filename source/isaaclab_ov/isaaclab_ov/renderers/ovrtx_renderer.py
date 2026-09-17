@@ -63,7 +63,7 @@ except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
         "The OVRTX renderer requires the optional 'ovrtx' runtime wheel, which is not installed. "
         "Run your command with: uv run --extra ovrtx <command> "
-        "(or, manually: python -m pip install 'ovrtx==0.4.1.364340')."
+        "(or, manually: python -m pip install 'ovrtx==0.5.0.377615')."
     ) from exc
 
 from isaaclab.cloner import ClonePlan
@@ -152,8 +152,8 @@ _READ_GPU_TRANSFORMS_ENV = "ISAAC_LAB_OVRTX_READ_GPU_TRANSFORMS"
 _USE_OVSTAGE_ENV = "ISAAC_LAB_OVRTX_USE_OVSTAGE"
 
 
-# Opts Linux out of the host wait, onto the same GPU-side ordering every other platform uses.
-# See :meth:`OVRTXRenderer._map_render_var_to_dlpack`.
+# Keeps Linux on the same GPU-side ordering every other platform uses. Set to ``0`` to put Linux
+# back on the host wait. See :meth:`OVRTXRenderer._map_render_var_to_dlpack`.
 _DISABLE_LINUX_CUDA_CPU_SYNC_ENV = "ISAAC_LAB_OVRTX_DISABLE_LINUX_CUDA_CPU_SYNC"
 
 
@@ -193,15 +193,15 @@ def _read_gpu_transforms_enabled() -> bool:
 def _gpu_side_render_var_sync_enabled() -> bool:
     """Return whether a render-var mapping is ordered by a GPU-side wait rather than a host wait.
 
-    See :meth:`OVRTXRenderer._map_render_var_to_dlpack` for why Linux is the exception, and
-    :data:`_DISABLE_LINUX_CUDA_CPU_SYNC_ENV` for opting out of it.
+    See :meth:`OVRTXRenderer._map_render_var_to_dlpack` for how the mapping is ordered, and
+    :data:`_DISABLE_LINUX_CUDA_CPU_SYNC_ENV` for putting Linux back on the host wait.
 
     Raises:
         ValueError: If the environment variable is set to anything other than ``0`` or ``1``.
     """
     if not sys.platform.startswith("linux"):
         return True
-    value = os.environ.get(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "0").strip()
+    value = os.environ.get(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "1").strip()
     if value not in {"0", "1"}:
         raise ValueError(
             f"Invalid value for environment variable `{_DISABLE_LINUX_CUDA_CPU_SYNC_ENV}`: {value}. Expected 0 or 1."
@@ -1152,14 +1152,15 @@ class OVRTXRenderer(BaseRenderer):
         """Map ``render_var`` for CUDA reads and yield it as a Warp array.
 
         The render is still in flight when the mapping returns, so reading it has to be ordered
-        against render completion. Normally that is a ``cudaStreamWaitEvent`` on the Warp stream the
+        against render completion. That is a ``cudaStreamWaitEvent`` on the Warp stream the
         consuming kernels run on, which is the ordering the OVRTX API is designed around.
 
-        On Linux that GPU-side wait measures substantially slower end to end, so the mapping is
-        instead requested with no GPU-side barrier and the calling thread blocks on the
-        render-completion event. Setting :data:`_DISABLE_LINUX_CUDA_CPU_SYNC_ENV` to ``1`` puts
-        Linux back on the GPU-side wait; it is an escape hatch for platforms where that trade-off
-        no longer holds, and is worth re-measuring before being relied on.
+        Linux previously blocked the calling thread on the render-completion event instead, which
+        measured faster on older OVRTX. On OVRTX 0.5 that host wait dominates the frame, so Linux
+        now takes the same GPU-side wait as every other platform. Setting
+        :data:`_DISABLE_LINUX_CUDA_CPU_SYNC_ENV` to ``0`` restores the host wait; it is an escape
+        hatch for platforms where the trade-off flips back, and is worth re-measuring before being
+        relied on.
 
         Note that ``sync_stream=0`` is OVRTX's "no sync" sentinel, *not* the NULL CUDA stream: the
         field encodes ``0=no sync, 1=default stream, >1=specific stream``, so omitting the argument

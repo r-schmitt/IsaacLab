@@ -413,30 +413,30 @@ def test_ovrtx_render_var_sync_is_gpu_side_off_linux(monkeypatch, platform):
     assert _gpu_side_render_var_sync_enabled() is True
 
 
-def test_ovrtx_render_var_sync_waits_on_host_on_linux(monkeypatch):
-    """Linux blocks the calling thread instead, which measures faster there."""
+def test_ovrtx_render_var_sync_is_gpu_side_on_linux(monkeypatch):
+    """Linux takes the same GPU-side wait by default; the host wait dominates on OVRTX 0.5."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, raising=False)
-    assert _gpu_side_render_var_sync_enabled() is False
-
-
-def test_ovrtx_render_var_sync_is_gpu_side_on_linux_when_disabled(monkeypatch):
-    """Opting out of the host wait puts Linux on the same GPU-side wait as every other platform."""
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "1")
     assert _gpu_side_render_var_sync_enabled() is True
 
 
-def test_ovrtx_render_var_sync_keeps_host_wait_when_explicitly_enabled(monkeypatch):
-    """``0`` is the default, so setting it explicitly must not change anything."""
+def test_ovrtx_render_var_sync_waits_on_host_on_linux_when_opted_out(monkeypatch):
+    """``0`` is the escape hatch back to blocking the calling thread on render completion."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "0")
     assert _gpu_side_render_var_sync_enabled() is False
 
 
+def test_ovrtx_render_var_sync_stays_gpu_side_when_explicitly_enabled(monkeypatch):
+    """``1`` is the default, so setting it explicitly must not change anything."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "1")
+    assert _gpu_side_render_var_sync_enabled() is True
+
+
 @pytest.mark.parametrize("value", ["", "true", "yes", "2"])
 def test_ovrtx_render_var_sync_rejects_non_boolean_values(monkeypatch, value):
-    """Values other than 0/1 are a configuration error, not a silent fallback to the host wait."""
+    """Values other than 0/1 are a configuration error, not a silent fallback to either ordering."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, value)
     with pytest.raises(ValueError, match="Expected 0 or 1"):
