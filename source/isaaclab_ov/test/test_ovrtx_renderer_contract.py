@@ -36,7 +36,7 @@ if not _MISSING_MODULES:
         _DISABLE_LINUX_CUDA_CPU_SYNC_ENV,
         OVRTXRenderData,
         OVRTXRenderer,
-        _gpu_side_render_var_sync_enabled,
+        _host_render_var_wait_enabled,
         ovrtx_use_ovstage_enabled,
     )
 else:
@@ -46,7 +46,7 @@ else:
     ovrtx_renderer_module = None
     ovrtx_use_ovstage_enabled = None
     _DISABLE_LINUX_CUDA_CPU_SYNC_ENV = None
-    _gpu_side_render_var_sync_enabled = None
+    _host_render_var_wait_enabled = None
     RENDER_VAR_FRAME_KEYS = None
 
 _SPAWN = PinholeCameraCfg(
@@ -406,32 +406,32 @@ def test_ovrtx_use_ovstage_rejects_non_boolean_values(monkeypatch):
 
 
 @pytest.mark.parametrize("platform", ["win32", "darwin"])
-def test_ovrtx_render_var_sync_is_gpu_side_off_linux(monkeypatch, platform):
-    """Everywhere but Linux the mapping is ordered by a GPU-side wait on the Warp stream."""
+def test_ovrtx_render_var_read_does_not_block_the_host_off_linux(monkeypatch, platform):
+    """Everywhere but Linux the stream barrier is the only ordering; the host never blocks."""
     monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.delenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, raising=False)
-    assert _gpu_side_render_var_sync_enabled() is True
+    assert _host_render_var_wait_enabled() is False
 
 
-def test_ovrtx_render_var_sync_is_gpu_side_on_linux(monkeypatch):
-    """Linux takes the same GPU-side wait by default; the host wait dominates on OVRTX 0.5."""
+def test_ovrtx_render_var_read_blocks_the_host_on_linux(monkeypatch):
+    """Linux blocks on top of the barrier, which measures ~1.5x faster than the barrier alone."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, raising=False)
-    assert _gpu_side_render_var_sync_enabled() is True
+    assert _host_render_var_wait_enabled() is True
 
 
-def test_ovrtx_render_var_sync_waits_on_host_on_linux_when_opted_out(monkeypatch):
-    """``0`` is the escape hatch back to blocking the calling thread on render completion."""
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "0")
-    assert _gpu_side_render_var_sync_enabled() is False
-
-
-def test_ovrtx_render_var_sync_stays_gpu_side_when_explicitly_enabled(monkeypatch):
-    """``1`` is the default, so setting it explicitly must not change anything."""
+def test_ovrtx_render_var_read_drops_the_host_block_when_opted_out(monkeypatch):
+    """``1`` leaves the barrier as the only ordering, matching non-Linux behaviour."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "1")
-    assert _gpu_side_render_var_sync_enabled() is True
+    assert _host_render_var_wait_enabled() is False
+
+
+def test_ovrtx_render_var_read_keeps_the_host_block_when_explicitly_enabled(monkeypatch):
+    """``0`` is the default, so setting it explicitly must not change anything."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "0")
+    assert _host_render_var_wait_enabled() is True
 
 
 @pytest.mark.parametrize("value", ["", "true", "yes", "2"])
@@ -440,7 +440,7 @@ def test_ovrtx_render_var_sync_rejects_non_boolean_values(monkeypatch, value):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, value)
     with pytest.raises(ValueError, match="Expected 0 or 1"):
-        _gpu_side_render_var_sync_enabled()
+        _host_render_var_wait_enabled()
 
 
 class _RecordingRenderVar:
@@ -452,8 +452,10 @@ class _RecordingRenderVar:
 
     def __init__(self):
         self.ordering: list[str] = []
+        self.sync_stream: int | None = None
 
     def map(self, *, device, sync_stream):
+        self.sync_stream = sync_stream
         if sync_stream:
             self.ordering.append("gpu")
         recorder = self
@@ -468,16 +470,16 @@ class _RecordingRenderVar:
         return contextlib.nullcontext(_Mapping())
 
 
-@pytest.mark.parametrize(("gpu_side", "expected"), [(True, "gpu"), (False, "host")])
-def test_ovrtx_map_render_var_orders_the_read_against_render_completion(monkeypatch, gpu_side, expected):
-    """The read is ordered exactly once -- by a GPU-side barrier or a host block, never by neither.
+@pytest.mark.parametrize(("host_wait", "expected"), [(False, ["gpu"]), (True, ["gpu", "host"])])
+def test_ovrtx_map_render_var_orders_the_read_against_render_completion(monkeypatch, host_wait, expected):
+    """The stream barrier always orders the read; the host block is an additional, optional wait.
 
     Ordering by neither is a silent race on half-written render output rather than a failure, so
-    this asserts which mechanism ran and not which API call carries it.
+    the barrier is asserted unconditionally, against the Warp stream the consuming kernels run on.
     """
     sentinel = object()
     render_var = _RecordingRenderVar()
-    monkeypatch.setattr(ovrtx_renderer_module, "_gpu_side_render_var_sync_enabled", lambda: gpu_side)
+    monkeypatch.setattr(ovrtx_renderer_module, "_host_render_var_wait_enabled", lambda: host_wait)
     monkeypatch.setattr(ovrtx_renderer_module.wp, "from_dlpack", lambda mapping: sentinel)
 
     renderer = _make_ovrtx_renderer_without_backend()
@@ -486,7 +488,8 @@ def test_ovrtx_map_render_var_orders_the_read_against_render_completion(monkeypa
     with renderer._map_render_var_to_dlpack(render_var) as array:
         assert array is sentinel
 
-    assert render_var.ordering == [expected]
+    assert render_var.ordering == expected
+    assert render_var.sync_stream == 99
 
 
 def test_ovrtx_cleanup_releases_only_the_given_render_data():

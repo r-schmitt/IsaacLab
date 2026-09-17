@@ -152,8 +152,8 @@ _READ_GPU_TRANSFORMS_ENV = "ISAAC_LAB_OVRTX_READ_GPU_TRANSFORMS"
 _USE_OVSTAGE_ENV = "ISAAC_LAB_OVRTX_USE_OVSTAGE"
 
 
-# Keeps Linux on the same GPU-side ordering every other platform uses. Set to ``0`` to put Linux
-# back on the host wait. See :meth:`OVRTXRenderer._map_render_var_to_dlpack`.
+# Drops the Linux host wait, leaving the stream barrier as the only ordering. Measures ~1.5x slower;
+# see :meth:`OVRTXRenderer._map_render_var_to_dlpack`.
 _DISABLE_LINUX_CUDA_CPU_SYNC_ENV = "ISAAC_LAB_OVRTX_DISABLE_LINUX_CUDA_CPU_SYNC"
 
 
@@ -190,23 +190,25 @@ def _read_gpu_transforms_enabled() -> bool:
     return value == "1"
 
 
-def _gpu_side_render_var_sync_enabled() -> bool:
-    """Return whether a render-var mapping is ordered by a GPU-side wait rather than a host wait.
+def _host_render_var_wait_enabled() -> bool:
+    """Return whether the calling thread also blocks on render completion, on top of the barrier.
 
-    See :meth:`OVRTXRenderer._map_render_var_to_dlpack` for how the mapping is ordered, and
-    :data:`_DISABLE_LINUX_CUDA_CPU_SYNC_ENV` for putting Linux back on the host wait.
+    The stream barrier orders the mapping on its own, so this is redundant for correctness. It is
+    on for Linux anyway because it measures ~1.5x faster there: blocking keeps the host from
+    queueing the next step's work behind the barrier, which would expose the full render latency
+    with nothing overlapping it. See :meth:`OVRTXRenderer._map_render_var_to_dlpack`.
 
     Raises:
         ValueError: If the environment variable is set to anything other than ``0`` or ``1``.
     """
     if not sys.platform.startswith("linux"):
-        return True
-    value = os.environ.get(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "1").strip()
+        return False
+    value = os.environ.get(_DISABLE_LINUX_CUDA_CPU_SYNC_ENV, "0").strip()
     if value not in {"0", "1"}:
         raise ValueError(
             f"Invalid value for environment variable `{_DISABLE_LINUX_CUDA_CPU_SYNC_ENV}`: {value}. Expected 0 or 1."
         )
-    return value == "1"
+    return value == "0"
 
 
 def _resolve_rtx_minimal_mode(data_types: list[str]) -> int | None:
@@ -1152,19 +1154,20 @@ class OVRTXRenderer(BaseRenderer):
         """Map ``render_var`` for CUDA reads and yield it as a Warp array.
 
         The render is still in flight when the mapping returns, so reading it has to be ordered
-        against render completion. That is a ``cudaStreamWaitEvent`` on the Warp stream the
-        consuming kernels run on, which is the ordering the OVRTX API is designed around.
+        against render completion. Passing the Warp stream records that dependency in the stream --
+        a ``cudaStreamWaitEvent`` against the render-completion event, which is the ordering the
+        OVRTX API is designed around and the only ordering non-Linux platforms use.
 
-        Linux previously blocked the calling thread on the render-completion event instead, which
-        measured faster on older OVRTX. On OVRTX 0.5 that host wait dominates the frame, so Linux
-        now takes the same GPU-side wait as every other platform. Setting
-        :data:`_DISABLE_LINUX_CUDA_CPU_SYNC_ENV` to ``0`` restores the host wait; it is an escape
-        hatch for platforms where the trade-off flips back, and is worth re-measuring before being
-        relied on.
+        Linux additionally blocks the calling thread, per :func:`_host_render_var_wait_enabled`.
+        That is redundant for correctness but measures ~1.5x faster, because a host that does not
+        block goes on to queue the next step's work behind the barrier and pays the render latency
+        with nothing overlapping it. Inserting the barrier costs nothing on top of the host wait:
+        by the time the host wakes, the event has fired and the barrier resolves as a no-op, and
+        while the host is blocked nothing else is queued behind it.
 
-        Note that ``sync_stream=0`` is OVRTX's "no sync" sentinel, *not* the NULL CUDA stream: the
-        field encodes ``0=no sync, 1=default stream, >1=specific stream``, so omitting the argument
-        entirely means ``1``, not ``0``.
+        Note that OVRTX's ``sync_stream`` field encodes ``0=no sync, 1=default stream, >1=specific
+        stream``, so ``0`` is a "no sync" sentinel rather than the NULL CUDA stream, and omitting
+        the argument entirely means ``1``, not ``0``.
 
         The yielded array is a zero-copy view of the mapped memory and is only valid inside the
         ``with`` block -- the mapping is released on exit.
@@ -1175,10 +1178,8 @@ class OVRTXRenderer(BaseRenderer):
         Yields:
             The render var's contents as a Warp array, valid for the duration of the context.
         """
-        gpu_side_sync = _gpu_side_render_var_sync_enabled()
-        sync_stream = self._warp_device.stream.cuda_stream if gpu_side_sync else 0
-        with render_var.map(device=Device.CUDA, sync_stream=sync_stream) as mapping:
-            if not gpu_side_sync:
+        with render_var.map(device=Device.CUDA, sync_stream=self._warp_device.stream.cuda_stream) as mapping:
+            if _host_render_var_wait_enabled():
                 mapping.wait()
             yield wp.from_dlpack(mapping)
 
