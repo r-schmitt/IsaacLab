@@ -20,3 +20,7 @@ Changed
   such as :meth:`~isaaclab_ov.physics.OvPhysxManager.set_gravity` now reuse the stage's path
   dictionary instead of building one per call, and author and drain the same ordinals as before,
   so no behavior changes.
+* Changed the OVRTX renderer's OVStage path to own its stage through
+  :class:`~isaaclab_ov.stage.SharedOvStage` and to take its per-frame ordinals from the stage's
+  output lane. Initial population, cloning, and binding setup now explicitly share the population
+  ordinal, and per-frame writes continue at the ordinals they used before, so no behavior changes.

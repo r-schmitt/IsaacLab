@@ -20,6 +20,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 if not _MISSING_MODULES:
+    from isaaclab_ov.ovstage_ordinals import OvStageOrdinalLanes
     from isaaclab_ov.renderers.ovrtx_renderer import OVRTXRenderer
     from isaaclab_ov.renderers.visual_materials import OVRTXVisualMaterialWriter
     from ovrtx import DataAccess
@@ -112,6 +113,22 @@ class _PathRecorder:
         self.destroyed.append(path_list)
 
 
+class _SharedStageRecorder:
+    """Stands in for :class:`~isaaclab_ov.stage.SharedOvStage` over a recording stage.
+
+    Sealing is resolved on the stage at call time, so a test may still inject a write-floor
+    failure by replacing ``advance_write_floor`` on the stage it recorded.
+    """
+
+    def __init__(self, stage, paths):
+        self.stage = stage
+        self.paths = paths
+        self.ordinals = OvStageOrdinalLanes()
+
+    def seal(self, ordinal):
+        self.stage.advance_write_floor(ordinal=ordinal).wait()
+
+
 def _renderer(*, use_ovstage: bool = False):
     events: list[str] = []
     renderer = OVRTXRenderer.__new__(OVRTXRenderer)
@@ -120,8 +137,11 @@ def _renderer(*, use_ovstage: bool = False):
     renderer._renderer = _NativeRecorder(events)
     renderer._visual_material_writer_ref = None
     if use_ovstage:
-        renderer._stage = _OvstageRecorder(events)
-        renderer._stage_paths = _PathRecorder()
+        stage = _OvstageRecorder(events)
+        paths = _PathRecorder()
+        renderer._shared_stage = _SharedStageRecorder(stage, paths)
+        renderer._stage = stage
+        renderer._stage_paths = paths
         renderer._current_ordinal = 7
     return renderer, events
 

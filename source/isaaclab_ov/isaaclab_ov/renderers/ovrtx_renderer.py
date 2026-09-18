@@ -96,7 +96,7 @@ from isaaclab_ov.renderers.ovrtx_usd import (
 )
 from isaaclab_ov.renderers.visual_materials import OVRTXVisualMaterialWriter
 from isaaclab_ov.stage import (
-    create_ovstage,
+    SharedOvStage,
     points_tensor_from_warp,
     xform_tensor_from_numpy,
     xform_tensor_from_warp,
@@ -1761,6 +1761,7 @@ class OVRTXRenderer(BaseRenderer):
     # ---------------------------------------------------------------------------
 
     def _init_fields_ovstage(self) -> None:
+        self._shared_stage: SharedOvStage | None = None
         self._stage = None
         self._stage_paths = None
         self._ovstage_exit_stack: contextlib.ExitStack | None = None
@@ -1823,14 +1824,14 @@ class OVRTXRenderer(BaseRenderer):
 
         logger.info("Loading USD into OvRTX via ovstage...")
         self._ovstage_exit_stack = contextlib.ExitStack()
-        self._stage = self._ovstage_exit_stack.enter_context(create_ovstage("isaaclab.ovrtx"))
-        self._stage_paths = self._ovstage_exit_stack.enter_context(ovstage.PathDictionary(self._stage))
-        # Ordinal 0 is the empty/unwritten state in ovstage; the first write must use >= 1.
-        self._current_ordinal += 1
-        ovstage.population.open_usd_from_string(
-            self._stage,
+        self._shared_stage = self._ovstage_exit_stack.enter_context(SharedOvStage("isaaclab.ovrtx"))
+        self._stage = self._shared_stage.stage
+        self._stage_paths = self._shared_stage.paths
+        # Every init-time write shares the population ordinal, so the scene the renderer first
+        # sees is complete: population, the clone, and the bindings below all land together.
+        self._current_ordinal = self._shared_stage.population_ordinal
+        self._shared_stage.populate_from_usda(
             combined_usd_string,
-            ordinal=self._current_ordinal,
             domains=ovstage.PopulationDomain.RENDERING,
         )
 
@@ -1885,10 +1886,12 @@ class OVRTXRenderer(BaseRenderer):
 
         # Commit all init-time writes then attach. attach_ovstage happens last so the renderer
         # immediately sees the fully-configured scene on its first step.
-        self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
+        self._shared_stage.seal(self._current_ordinal)
         self._renderer.attach_ovstage(self._stage)
         logger.info("OVRTX loaded USD from string successfully via ovstage")
-        self._current_ordinal += 1
+        # Per-frame poses are simulation output: written for the renderer to draw, never drained
+        # back into a physics runtime sharing this stage.
+        self._current_ordinal = self._shared_stage.ordinals.next_output()
 
     def _clone_sources_ovstage(self):
         """Clone sources in OVRTX using the scene :class:`~isaaclab.cloner.ClonePlan` (ovstage path)."""
@@ -2390,7 +2393,7 @@ class OVRTXRenderer(BaseRenderer):
         try:
             if material_writer is not None:
                 material_writer.publish()
-            self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
+            self._shared_stage.seal(self._current_ordinal)
         finally:
             if material_writer is not None:
                 drain_errors = contextlib.nullcontext() if sys.exc_info()[0] is None else contextlib.suppress(Exception)
@@ -2401,7 +2404,7 @@ class OVRTXRenderer(BaseRenderer):
             delta_time=1.0 / 60.0,
             ordinal=self._current_ordinal,
         )
-        self._current_ordinal += 1
+        self._current_ordinal = self._shared_stage.ordinals.next_output()
         product_path = self._render_product_paths[0]
         if product_path in products and len(products[product_path].frames) > 0:
             self._process_render_frame(
@@ -2493,6 +2496,7 @@ class OVRTXRenderer(BaseRenderer):
         if self._ovstage_exit_stack is not None:
             self._ovstage_exit_stack.close()
         self._ovstage_exit_stack = None
+        self._shared_stage = None
         self._stage = None
         self._stage_paths = None
 

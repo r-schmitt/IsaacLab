@@ -27,8 +27,9 @@ turn its next write into a write-floor violation.
 
 from __future__ import annotations
 
-# First ordinal an OVStage carries. Population writes the initial scene here and the application
-# seals it before either consumer attaches, so both lanes start above it.
+# First ordinal an OVStage can be written at; ordinal 0 is its empty, unwritten state. Population
+# writes the initial scene here and the application seals it before either consumer attaches, so
+# both lanes start above it.
 POPULATION_ORDINAL = 1
 
 

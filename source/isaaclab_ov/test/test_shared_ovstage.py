@@ -32,7 +32,6 @@ def shared_stage_seams(monkeypatch: pytest.MonkeyPatch):
     independent of whatever stage the rest of the session holds.
     """
     import ovstage
-
     from isaaclab_ov import stage as stage_module
 
     events: list[tuple[str, object]] = []
@@ -114,7 +113,6 @@ def test_accessing_a_destroyed_stage_raises_instead_of_handing_back_a_dangling_h
 def test_a_failed_path_dictionary_does_not_leak_the_stage(monkeypatch: pytest.MonkeyPatch, shared_stage_seams: list):
     """Construction is all-or-nothing: a half-built wrapper has no owner to destroy it."""
     import ovstage
-
     from isaaclab_ov.stage import SharedOvStage
 
     def _failing_path_dictionary(stage):
@@ -131,7 +129,6 @@ def test_a_failed_path_dictionary_does_not_leak_the_stage(monkeypatch: pytest.Mo
 def test_population_and_its_seal_land_on_the_population_ordinal(shared_stage_seams: list):
     """Consumers attach at the population ordinal, so the initial scene must be written there."""
     import ovstage
-
     from isaaclab_ov.stage import SharedOvStage
 
     shared = SharedOvStage("lifetime.populate")
