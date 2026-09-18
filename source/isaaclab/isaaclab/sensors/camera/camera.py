@@ -225,6 +225,9 @@ class Camera(SensorBase):
                 logger.info("Using renderer: %s", type(self._renderer).__name__)
         # Render data — assigned in _initialize_impl.
         self._render_data = None
+        # Render spec — resolved by the first :meth:`prepare_stage_for_rendering` call, which may
+        # run pre-physics, and reused by initialization.
+        self._render_spec: CameraRenderSpec | None = None
         # Frame view — assigned in _initialize_impl.
         self._view: FrameView | None = None
 
@@ -517,24 +520,26 @@ class Camera(SensorBase):
             env_ids_wp = self._resolve_env_ids_wp(env_ids)
             self._update_poses(env_ids_wp, frame_op=2)
 
-    """
-    Implementation.
-    """
+    def prepare_stage_for_rendering(self) -> CameraRenderSpec:
+        """Author this camera's renderer-side USD setup and prepare the stage for rendering.
 
-    def _initialize_impl(self):
-        """Initializes the sensor handles and internal buffers.
+        Performs the USD authoring a renderer needs before it snapshots the stage: per-camera
+        overrides through :meth:`~isaaclab.renderers.BaseRenderer.prepare_cameras`, then the
+        backend's own stage preparation. Neither needs physics handles -- only the published clone
+        plan and the authored camera prims -- so this may run before the physics backend is warmed
+        up. A backend that shares one stage with physics relies on that, since it has to contribute
+        its content before physics attaches.
 
-        This function delegates all render-product and annotator management to the
-        :class:`~isaaclab.renderers.base_renderer.BaseRenderer` created in :meth:`__init__`. It also
-        initializes the internal buffers to store the data.
+        Idempotent: the resolved spec is cached, and later calls return it without re-authoring.
+
+        Returns:
+            The render spec describing this camera to its renderer backend.
 
         Raises:
-            RuntimeError: If the number of camera prims in the view does not match the number of environments.
-            RuntimeError: Propagated from the renderer constructor when the active backend's runtime requirements
-                are not satisfied.
+            RuntimeError: If the simulation context is not initialized.
         """
-        # Initialize parent class
-        super()._initialize_impl()
+        if self._render_spec is not None:
+            return self._render_spec
 
         sim_ctx = sim_utils.SimulationContext.instance()
         if sim_ctx is None:
@@ -542,10 +547,13 @@ class Camera(SensorBase):
         # Normally created in ``__init__``; only missing when the camera was built without a simulation.
         if self._renderer is None:
             self._renderer = sim_ctx.render_context.get_renderer(self.cfg.renderer_cfg)
+        # Running ahead of initialization, so resolve what the spec needs. Initialization recomputes
+        # both from the same inputs.
+        self._device = sim_ctx.device
+        self._resolve_env_count(sim_ctx)
 
-        # Build the render spec early — both the wrapper ISP (which delegates
-        # any renderer-side per-camera setup) and ``create_render_data`` consume
-        # it, and the prims are already authored at this point.
+        # The prims are already authored, so the spec can be built here; both the wrapper ISP
+        # (which delegates any renderer-side per-camera setup) and ``create_render_data`` consume it.
         cam_paths = tuple(str(p.GetPath()) for p in sim_utils.find_matching_prims(self.cfg.prim_path, self.stage))
         env_0_prefix = "/World/envs/env_0/"
         rel_under_env0 = (
@@ -571,6 +579,30 @@ class Camera(SensorBase):
         # references to prims located in the stage.
         sim_ctx.render_context.ensure_prepare_stage(self.stage, self._num_envs)
 
+        self._render_spec = render_spec
+        return render_spec
+
+    """
+    Implementation.
+    """
+
+    def _initialize_impl(self):
+        """Initializes the sensor handles and internal buffers.
+
+        This function delegates all render-product and annotator management to the
+        :class:`~isaaclab.renderers.base_renderer.BaseRenderer` created in :meth:`__init__`. It also
+        initializes the internal buffers to store the data.
+
+        Raises:
+            RuntimeError: If the number of camera prims in the view does not match the number of environments.
+            RuntimeError: Propagated from the renderer constructor when the active backend's runtime requirements
+                are not satisfied.
+        """
+        # Initialize parent class
+        super()._initialize_impl()
+
+        render_spec = self.prepare_stage_for_rendering()
+
         self._view = FrameView(self.cfg.prim_path, device=self._device, stage=self.stage)
         # Check that sizes are correct
         if self._view.count != self._num_envs:
@@ -587,8 +619,8 @@ class Camera(SensorBase):
         # Convert all encapsulated prims to Camera. Newton keeps only source USD camera prims.
         self._sensor_prims.clear()
         view_prims = list(self._view.prims)
-        if not view_prims and cam_paths:
-            view_prims = [self.stage.GetPrimAtPath(cam_paths[0])] * self._view.count
+        if not view_prims and render_spec.camera_prim_paths:
+            view_prims = [self.stage.GetPrimAtPath(render_spec.camera_prim_paths[0])] * self._view.count
         for cam_prim in view_prims:
             # Obtain the prim path
             cam_prim_path = cam_prim.GetPath().pathString
@@ -932,6 +964,9 @@ class Camera(SensorBase):
             self._renderer.cleanup(self._render_data)
         self._render_data = None
         self._renderer = None
+        # Dropped with the renderer: the next initialization re-authors its per-camera setup
+        # against whichever backend it resolves.
+        self._render_spec = None
         # call parent
         super()._invalidate_initialize_callback(event)
         # release backend state deterministically, then invalidate the view

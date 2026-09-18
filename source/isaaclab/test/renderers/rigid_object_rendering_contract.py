@@ -155,9 +155,25 @@ def run_rigid_object_scale_and_pose_rendering_contract(backend: RigidObjectRende
         rigid_object = scene["rigid_object"]
         camera = scene["camera"]
 
+        # The renderer's USD setup must be fully resolvable from the built scene alone, before
+        # physics warms up: a backend sharing one stage with physics has no later chance to
+        # contribute to it. Initialization must then reuse that setup instead of re-authoring it.
+        _require(not camera.is_initialized, f"[{backend.name}] Camera initialized before the first sim.reset().")
+        pre_physics_spec = camera.prepare_stage_for_rendering()
+        _require(
+            pre_physics_spec.num_instances == _NUM_ENVS,
+            f"[{backend.name}] Expected {_NUM_ENVS} camera instances pre-physics, got"
+            f" {pre_physics_spec.num_instances}.",
+        )
+
         try:
             sim.reset()
             scene.reset()
+            _require(
+                camera.prepare_stage_for_rendering() is pre_physics_spec,
+                f"[{backend.name}] Initialization re-authored the renderer setup instead of reusing the"
+                " pre-physics one.",
+            )
             _require(rigid_object.is_initialized, f"[{backend.name}] Rigid object did not initialize.")
             if backend.with_articulation:
                 _require(scene["articulation"].is_initialized, f"[{backend.name}] Articulation did not initialize.")

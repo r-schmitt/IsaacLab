@@ -226,19 +226,19 @@ class SensorBase(ABC):
     Implementation specific.
     """
 
-    @abstractmethod
-    def _initialize_impl(self):
-        """Initializes the sensor-related handles and internal buffers."""
-        # Obtain Simulation Context
-        sim = sim_utils.SimulationContext.instance()
-        if sim is None:
-            raise RuntimeError("Simulation Context is not initialized!")
-        # Obtain device and backend
-        self._device = sim.device
-        self._backend = sim.backend
-        self._sim_physics_dt = sim.get_physics_dt()
-        # Count number of environments. Prefer the active simulation's clone plan when USD
-        # only carries the env_0 prototype (e.g. Newton clones solver-side).
+    def _resolve_env_count(self, sim: sim_utils.SimulationContext) -> None:
+        """Resolve the clone plan, parent prims, and environment count for this sensor.
+
+        Depends only on the published clone plan and the authored USD prims, not on physics
+        handles, so it may run before the physics backend is warmed up. Idempotent: callers that
+        need the count before :meth:`_initialize_impl` may resolve it early and let initialization
+        recompute the same values.
+
+        Args:
+            sim: Active simulation context, used for its published clone plan.
+        """
+        # Prefer the active simulation's clone plan when USD only carries the env_0 prototype
+        # (e.g. Newton clones solver-side).
         self._clone_plan = sim.get_clone_plan()
         clone_plan = self._clone_plan
         clone_plan_matches = ()
@@ -255,6 +255,19 @@ class SensorBase(ABC):
             env_prim_path_expr = "/".join(sim_utils.split_path_expr(self.cfg.prim_path)[:-1])
             self._parent_prims = sim_utils.find_matching_prims(env_prim_path_expr)
             self._num_envs = len(self._parent_prims)
+
+    @abstractmethod
+    def _initialize_impl(self):
+        """Initializes the sensor-related handles and internal buffers."""
+        # Obtain Simulation Context
+        sim = sim_utils.SimulationContext.instance()
+        if sim is None:
+            raise RuntimeError("Simulation Context is not initialized!")
+        # Obtain device and backend
+        self._device = sim.device
+        self._backend = sim.backend
+        self._sim_physics_dt = sim.get_physics_dt()
+        self._resolve_env_count(sim)
         # Create warp env mask arrays for "all envs" cases and resets.
         # Note: We use wp.to_torch() to create zero-copy torch tensor views of warp arrays.
         # This allows warp arrays to be passed to warp kernels while the corresponding torch

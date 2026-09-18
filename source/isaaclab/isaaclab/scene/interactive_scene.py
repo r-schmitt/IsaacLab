@@ -206,11 +206,20 @@ class InteractiveScene:
         self._env_origins_plan = self.sim.get_clone_plan()
 
         # Every sensor exists by now, so all visualizer and camera-renderer requirements are visible.
-        cam_types = [s.cfg.renderer_cfg.renderer_type for s in self._sensors.values() if isinstance(s.cfg, CameraCfg)]
+        cameras = [sensor for sensor in self._sensors.values() if isinstance(sensor.cfg, CameraCfg)]
+        cam_types = [sensor.cfg.renderer_cfg.renderer_type for sensor in cameras]
         for type_name in requested_viz_types.union(cam_types):
             requires_stage, requires_model = REQUIRES_STAGE_AND_MODEL[type_name]
             self.sim.requires_usd_stage |= requires_stage
             self.sim.requires_newton_model |= requires_model
+
+        # Let every camera author its renderer-side USD setup now, while the clone plan is
+        # published and the prims are authored but physics has not warmed up. A renderer that
+        # shares one stage with physics has to contribute its content before physics attaches to
+        # it, and sensor initialization runs too late for that. Cameras built outside a scene fall
+        # back to authoring this during initialization.
+        for camera in cameras:
+            camera.prepare_stage_for_rendering()
 
         # Collision filtering is PhysX-only (matches both physx and ovphysx).
         if self.cfg.filter_collisions and "physx" in self.physics_backend and scene_from_cfg:
