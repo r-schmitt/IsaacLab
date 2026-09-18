@@ -40,8 +40,7 @@ from isaaclab.scene_data.deformable_discovery import (
 from isaaclab_ov._clone import CloneTransform, clone_transforms_from_positions
 from isaaclab_ov._runtime import import_ovphysx
 from isaaclab_ov.cloner import OvPhysxReplicateContext
-from isaaclab_ov.ovstage_ordinals import POPULATION_ORDINAL, OvStageOrdinalLanes
-from isaaclab_ov.stage import create_ovstage
+from isaaclab_ov.stage import SharedOvStage
 
 from .ovphysx_compat import OVPHYSX_LIFECYCLE_ENTRY_POINTS
 from .ovphysx_manager_cfg import DEFAULT_COOKED_COLLIDER_CACHE_DIR
@@ -407,11 +406,10 @@ class OvPhysxManager(PhysicsManager):
 
     _cfg: ClassVar[OvPhysxCfg | None] = None
     _physx: ClassVar[Any] = None  # ovphysx.PhysX (lazy import)
-    _ovstage: ClassVar[Any] = None
+    # Stage attached to the runtime, or ``None`` while no stage is attached.
+    _ovstage: ClassVar[SharedOvStage | None] = None
     _stage_usda: ClassVar[str | None] = None
     _warmup_done: ClassVar[bool] = False
-    # Ordinal lanes for the attached stage, or ``None`` while no stage is attached.
-    _ordinals: ClassVar[OvStageOrdinalLanes | None] = None
     _requires_full_stage: ClassVar[bool] = False
     # Device mode is process-wide; later contexts must reuse the first selected device.
     _locked_device: ClassVar[str | None] = None
@@ -698,12 +696,10 @@ class OvPhysxManager(PhysicsManager):
         """Populate an OVStage from USDA text and attach it to the runtime."""
         import ovstage  # noqa: PLC0415
 
-        stage = create_ovstage("isaaclab")
+        shared = SharedOvStage("isaaclab")
         try:
-            ovstage.population.open_usd_from_string(
-                stage,
+            shared.populate_from_usda(
                 stage_usda,
-                ordinal=POPULATION_ORDINAL,
                 # FIXME: Use PHYSICS once OVStage includes native-instance collider
                 # dependencies in physics-only population.
                 domains=ovstage.PopulationDomain.ALL,
@@ -711,14 +707,12 @@ class OvPhysxManager(PhysicsManager):
             # ovphysx reads sealed data only: population completes the writes but never
             # commits the ordinal, so attaching at an unsealed ordinal fails the parse
             # and silently yields an empty scene.
-            stage.advance_write_floor(ordinal=POPULATION_ORDINAL).wait()
-            cls._physx.attach_ovstage(stage, read_ordinal=POPULATION_ORDINAL)
+            shared.seal(shared.population_ordinal)
+            cls._physx.attach_ovstage(shared.stage, read_ordinal=shared.population_ordinal)
         except Exception:
-            stage.destroy()
+            shared.destroy()
             raise
-        cls._ovstage = stage
-
-        cls._ordinals = OvStageOrdinalLanes(POPULATION_ORDINAL)
+        cls._ovstage = shared
 
     @classmethod
     def _destroy_ovstage(cls) -> None:
@@ -726,8 +720,6 @@ class OvPhysxManager(PhysicsManager):
         if cls._ovstage is not None:
             cls._ovstage.destroy()
             cls._ovstage = None
-
-        cls._ordinals = None
 
     @staticmethod
     def _close_physx_views(physx: Any) -> None:
@@ -784,7 +776,7 @@ class OvPhysxManager(PhysicsManager):
             RuntimeError: If the OVPhysX simulation has not been initialized.
             ValueError: If gravity does not contain three finite values.
         """
-        if cls._sim is None or cls._physx is None or cls._ovstage is None or cls._ordinals is None:
+        if cls._sim is None or cls._physx is None or cls._ovstage is None:
             raise RuntimeError("OvPhysxManager has not been initialized yet.")
 
         gravity_array = np.asarray(gravity, dtype=np.float32)
@@ -796,21 +788,20 @@ class OvPhysxManager(PhysicsManager):
             direction = np.array([[0.0, 0.0, -1.0]], dtype=np.float32)
         else:
             direction = (gravity_array / magnitude).reshape(1, 3)
-        ordinal = cls._ordinals.next_control()
-
-        import ovstage  # noqa: PLC0415
+        shared = cls._ovstage
+        stage = shared.stage
+        ordinal = shared.ordinals.next_control()
 
         with contextlib.ExitStack() as cleanup:
-            paths = cleanup.enter_context(ovstage.PathDictionary(cls._ovstage))
-            path_list = paths.create_path_list_from_strings([cls._sim.cfg.physics_prim_path])
-            cleanup.callback(paths.destroy_path_list, path_list)
-            query = cleanup.enter_context(cls._ovstage.query_from_path_list(path_list))
-            cls._ovstage.write_attribute(query, "physics:gravityDirection", ordinal, direction, is_array=False).wait()
-            cls._ovstage.write_attribute(
+            path_list = shared.paths.create_path_list_from_strings([cls._sim.cfg.physics_prim_path])
+            cleanup.callback(shared.paths.destroy_path_list, path_list)
+            query = cleanup.enter_context(stage.query_from_path_list(path_list))
+            stage.write_attribute(query, "physics:gravityDirection", ordinal, direction, is_array=False).wait()
+            stage.write_attribute(
                 query, "physics:gravityMagnitude", ordinal, np.array([magnitude], dtype=np.float32), is_array=False
             ).wait()
-            cls._ovstage.advance_write_floor(ordinal=ordinal).wait()
-            cls._physx.update_from_ovstage(*cls._ordinals.drain_range(ordinal))
+            shared.seal(ordinal)
+            cls._physx.update_from_ovstage(*shared.ordinals.drain_range(ordinal))
 
         # Only publish once the ordinal has been applied, so a failed write leaves
         # :meth:`get_gravity` reporting the gravity the scene is still running with.

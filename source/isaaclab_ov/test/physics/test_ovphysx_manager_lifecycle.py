@@ -17,6 +17,8 @@ import pytest
 
 pytest.importorskip("ovphysx.types", reason="ovphysx wheel not installed")
 
+from isaaclab_ov.ovstage_ordinals import OvStageOrdinalLanes  # noqa: E402
+
 
 class _FakePhysXConfig:
     def __init__(self, num_threads=None, cooked_collider_cache_dir=None, carbonite_overrides=None):
@@ -47,7 +49,6 @@ def manager_module(monkeypatch):
         "_physx": None,
         "_ovstage": None,
         "_stage_usda": None,
-        "_ordinals": None,
         "_warmup_done": False,
         "_requires_full_stage": False,
         "_locked_device": None,
@@ -277,15 +278,6 @@ def test_set_gravity_writes_and_releases_ovstage_control_resources(monkeypatch, 
     calls = []
 
     class FakePathDictionary:
-        def __init__(self, stage):
-            self.stage = stage
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            calls.append(("destroy_dictionary",))
-
         def create_path_list_from_strings(self, paths):
             calls.append(("paths", paths))
             return "physics-scene-paths"
@@ -313,19 +305,22 @@ def test_set_gravity_writes_and_releases_ovstage_control_resources(monkeypatch, 
                 raise RuntimeError("write failed")
             return SimpleNamespace(wait=lambda: None)
 
-        def advance_write_floor(self, *, ordinal):
+    class FakeSharedStage:
+        """Stands in for :class:`~isaaclab_ov.stage.SharedOvStage` with real ordinal lanes."""
+
+        def __init__(self):
+            self.stage = FakeStage()
+            self.paths = FakePathDictionary()
+            self.ordinals = OvStageOrdinalLanes()
+
+        def seal(self, ordinal):
             calls.append(("seal", ordinal))
-            return SimpleNamespace(wait=lambda: None)
 
     class FakePhysX:
         def update_from_ovstage(self, start_ordinal, end_ordinal):
             calls.append(("update", start_ordinal, end_ordinal))
 
-    fake_ovstage = ModuleType("ovstage")
-    fake_ovstage.PathDictionary = FakePathDictionary
-    monkeypatch.setitem(sys.modules, "ovstage", fake_ovstage)
-    monkeypatch.setattr(manager, "_ovstage", FakeStage())
-    monkeypatch.setattr(manager, "_ordinals", manager_module.OvStageOrdinalLanes())
+    monkeypatch.setattr(manager, "_ovstage", FakeSharedStage())
     monkeypatch.setattr(manager, "_physx", FakePhysX())
     monkeypatch.setattr(
         manager,
@@ -345,7 +340,6 @@ def test_set_gravity_writes_and_releases_ovstage_control_resources(monkeypatch, 
             ("update", 2, 2),
             ("release_query", "physics-scene-query"),
             ("destroy_paths", "physics-scene-paths"),
-            ("destroy_dictionary",),
         ]
     else:
         with pytest.raises(RuntimeError, match=f"{failure} failed"):
@@ -361,12 +355,7 @@ def test_set_gravity_writes_and_releases_ovstage_control_resources(monkeypatch, 
                     ("release_query", "physics-scene-query"),
                 ]
             )
-        expected_calls.extend(
-            [
-                ("destroy_paths", "physics-scene-paths"),
-                ("destroy_dictionary",),
-            ]
-        )
+        expected_calls.append(("destroy_paths", "physics-scene-paths"))
 
     assert calls == expected_calls
     # ``get_gravity`` must report what the scene is actually running with: the new vector

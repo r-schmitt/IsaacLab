@@ -472,19 +472,18 @@ def test_manager_attaches_and_releases_owned_ovstage(monkeypatch):
     events = []
     monkeypatch.setattr(om_mod, "OVPHYSX_LIFECYCLE_ENTRY_POINTS", _LEGACY_LIFECYCLE_ENTRY_POINTS)
 
-    class FakeWriteFloorOp:
-        def __init__(self, ordinal):
-            self._ordinal = ordinal
+    class FakeSharedStage:
+        population_ordinal = 1
 
-        def wait(self):
-            events.append(("seal", self._ordinal))
-
-    class FakeStage:
         def __init__(self, name):
             events.append(("stage", name))
+            self.stage = f"stage:{name}"
 
-        def advance_write_floor(self, ordinal):
-            return FakeWriteFloorOp(ordinal)
+        def populate_from_usda(self, usda, *, domains):
+            events.append(("populate", self.stage, usda, self.population_ordinal, domains))
+
+        def seal(self, ordinal):
+            events.append(("seal", ordinal))
 
         def destroy(self):
             events.append(("destroy",))
@@ -505,15 +504,10 @@ def test_manager_attaches_and_releases_owned_ovstage(monkeypatch):
 
     fake_ovstage = ModuleType("ovstage")
     fake_ovstage.PopulationDomain = SimpleNamespace(ALL="all")
-    fake_ovstage.population = SimpleNamespace(
-        open_usd_from_string=lambda stage, usda, ordinal, domains: events.append(
-            ("populate", stage, usda, ordinal, domains)
-        )
-    )
     monkeypatch.setitem(sys.modules, "ovstage", fake_ovstage)
-    # The manager builds its stage through the shared helper so every stage in the process gets
-    # the same ovstage configuration; that is the seam to fake, not ``ovstage.Stage``.
-    monkeypatch.setattr(om_mod, "create_ovstage", FakeStage)
+    # The manager builds its stage through the shared wrapper, which owns stage configuration,
+    # the path dictionary, and the ordinal lanes; that is the seam to fake, not ``ovstage.Stage``.
+    monkeypatch.setattr(om_mod, "SharedOvStage", FakeSharedStage)
 
     previous_physx = OvPhysxManager._physx
     previous_ovstage = getattr(OvPhysxManager, "_ovstage", None)
@@ -527,7 +521,7 @@ def test_manager_attaches_and_releases_owned_ovstage(monkeypatch):
     )
     try:
         OvPhysxManager._attach_ovstage("#usda 1.0")
-        stage = OvPhysxManager._ovstage
+        shared = OvPhysxManager._ovstage
         OvPhysxManager._release_physx()
     finally:
         OvPhysxManager._physx = previous_physx
@@ -537,9 +531,9 @@ def test_manager_attaches_and_releases_owned_ovstage(monkeypatch):
     # only, so attaching at an unsealed ordinal silently yields an empty scene.
     assert events == [
         ("stage", "isaaclab"),
-        ("populate", stage, "#usda 1.0", 1, "all"),
+        ("populate", shared.stage, "#usda 1.0", 1, "all"),
         ("seal", 1),
-        ("attach", stage, 1),
+        ("attach", shared.stage, 1),
         ("close_views", physx),
         ("reset",),
         ("wait", 17),
@@ -750,21 +744,20 @@ def test_manager_destroys_ovstage_when_population_fails(monkeypatch):
 
     destroyed = []
 
-    class FakeStage:
+    class FakeSharedStage:
         def __init__(self, name):
             self.name = name
+
+        def populate_from_usda(self, usda, *, domains):
+            raise RuntimeError("population failed")
 
         def destroy(self):
             destroyed.append(self.name)
 
-    def fail_population(*args, **kwargs):
-        raise RuntimeError("population failed")
-
     fake_ovstage = ModuleType("ovstage")
     fake_ovstage.PopulationDomain = SimpleNamespace(ALL="all")
-    fake_ovstage.population = SimpleNamespace(open_usd_from_string=fail_population)
     monkeypatch.setitem(sys.modules, "ovstage", fake_ovstage)
-    monkeypatch.setattr(om_mod, "create_ovstage", FakeStage)
+    monkeypatch.setattr(om_mod, "SharedOvStage", FakeSharedStage)
 
     previous_ovstage = getattr(OvPhysxManager, "_ovstage", None)
     OvPhysxManager._ovstage = None
