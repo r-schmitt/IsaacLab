@@ -41,11 +41,13 @@ from isaaclab_ov._clone import CloneTransform, clone_transforms_from_positions
 from isaaclab_ov._runtime import import_ovphysx
 from isaaclab_ov.cloner import OvPhysxReplicateContext
 from isaaclab_ov.stage import SharedOvStage
+from isaaclab_ov.stage_usda import shared_stage_usda
 
 from .ovphysx_compat import OVPHYSX_LIFECYCLE_ENTRY_POINTS
 from .ovphysx_manager_cfg import DEFAULT_COOKED_COLLIDER_CACHE_DIR
 
 if TYPE_CHECKING:
+    from isaaclab.cloner import ClonePlan
     from isaaclab.sim.simulation_context import SimulationContext
 
     from .ovphysx_manager_cfg import OvPhysxCfg
@@ -544,6 +546,8 @@ class OvPhysxManager(PhysicsManager):
         cls._warmup_done = False
         cls._requires_full_stage = False
         cls._stage_usda = None
+        # This simulation gets a fresh USD stage, so any serialization of the last one is stale.
+        shared_stage_usda().invalidate()
         cls._pending_clones = []
         cls._active_clone_recipes = []
         # Construct the SceneDataBackend eagerly so :class:`SimulationContext`
@@ -633,6 +637,7 @@ class OvPhysxManager(PhysicsManager):
                 cls._release_physx()
             finally:
                 cls._stage_usda = None
+                shared_stage_usda().invalidate()
                 cls._warmup_done = False
                 cls._requires_full_stage = False
                 cls._active_clone_recipes = []
@@ -906,39 +911,30 @@ class OvPhysxManager(PhysicsManager):
             logger.info("OvPhysxManager: materialized %d clone targets in the full-stage layer", len(operations))
         return len(operations)
 
-    @staticmethod
-    def _strip_nonzero_environments(layer: Any) -> int:
-        """Strip authored ``env_<i>`` prims other than ``env_0`` from a stage layer."""
-        envs_spec = layer.GetPrimAtPath("/World/envs")
-        if envs_spec is None or not envs_spec:
-            return 0
-
-        env_name_re = re.compile(r"^env_(\d+)$")
-        names_to_remove = [
-            child_name
-            for child_name in list(envs_spec.nameChildren.keys())
-            if (match := env_name_re.match(child_name)) and match.group(1) != "0"
-        ]
-        for child_name in names_to_remove:
-            del envs_spec.nameChildren[child_name]
-        return len(names_to_remove)
-
     @classmethod
-    def _serialize_selected_stage(cls, sim_stage: Any) -> str:
-        """Serialize the selected stage representation for OVStage population."""
+    def _serialize_selected_stage(cls, sim_stage: Any, clone_plan: ClonePlan | None) -> str:
+        """Serialize the selected stage representation for OVStage population.
+
+        The default path takes the serialization every OVStage consumer shares, so a render
+        consumer on the same stage populates from the same text rather than exporting the scene a
+        second time. The full-stage path cannot: it bakes every environment into a flattened layer
+        and materializes the clone targets USD never authored, which is the opposite of the
+        prototype-only trim the shared serialization performs. That path keeps its own export until
+        the shared clone replaces it.
+
+        Args:
+            sim_stage: Host USD stage to serialize.
+            clone_plan: Published clone plan, whose sources decide what survives the default trim.
+
+        Returns:
+            USDA text to populate an OVStage from.
+        """
+        if not cls._requires_full_stage:
+            return shared_stage_usda().resolve(sim_stage, clone_plan)
+
         layer = sim_stage.Flatten()
-        if cls._requires_full_stage:
-            cls._materialize_pending_clones_in_layer(layer)
-            logger.info("OvPhysxManager: serialized the full USD stage in memory")
-        else:
-            removed_count = cls._strip_nonzero_environments(layer)
-            if removed_count:
-                logger.info(
-                    "OvPhysxManager: stripped %d env_<i!=0> subtrees from in-memory USD (kept env_0 + globals)",
-                    removed_count,
-                )
-            else:
-                logger.debug("OvPhysxManager: no cloned environments to strip — serialized stage as-is.")
+        cls._materialize_pending_clones_in_layer(layer)
+        logger.info("OvPhysxManager: serialized the full USD stage in memory")
         return layer.ExportToString()
 
     @classmethod
@@ -1008,28 +1004,24 @@ class OvPhysxManager(PhysicsManager):
                 scene_prim.CreateAttribute("physxScene:envIdInBoundsBitCount", Sdf.ValueTypeNames.Int).Set(4)
             cls._configure_physx_scene_prim(scene_prim, PhysicsManager._cfg, ovphysx_device)
 
-        # Flatten the current USD stage to USDA text so OVStage can populate it
-        # without an intermediate file.
+        # Serialize the USD stage to USDA text so OVStage can populate it without an intermediate
+        # file.
         #
-        # When ``InteractiveScene`` runs with ``clone_usd=True``, the live USD
-        # stage carries env_0..N's full asset subtrees as authored copies.
-        # Handing that whole stage to OVStage would make the wheel ingest
-        # all 4096 envs as independent USD-defined bodies, defeating the
-        # ``physx.clone()`` fast path and turning every subsequent
-        # ``create_tensor_binding`` call into an O(N) USD enumeration -- the
-        # hang you'd see at large env counts.
+        # When ``InteractiveScene`` runs with ``clone_usd=True``, the live USD stage carries
+        # env_0..N's full asset subtrees as authored copies. Handing that whole stage to OVStage
+        # would make the wheel ingest all 4096 envs as independent USD-defined bodies, defeating
+        # the ``physx.clone()`` fast path and turning every subsequent ``create_tensor_binding``
+        # call into an O(N) USD enumeration -- the hang you'd see at large env counts.
         #
-        # By default, strip ``/World/envs/env_<i>`` for i != 0 from the
-        # flattened layer before handing it to the wheel. Sensors that read
-        # USD directly (RayCaster, Camera, ContactSensor discovery) still see
-        # the full N-env stage; only the wheel-side physics ingestion is
-        # scoped to env_0, and ``physx.clone()`` re-populates env_1..N in
-        # the physics runtime with proper clone lineage (which is what the
-        # binding fast path expects). Features that need distinct authored
-        # physics in every environment request the full stage; missing
-        # heterogeneous clone targets are materialized in its flattened layer.
+        # The serialization therefore carries only the clone plan's prototypes. Sensors that read
+        # USD directly (RayCaster, Camera, ContactSensor discovery) still see the full N-env stage;
+        # only the wheel-side physics ingestion is scoped to the prototypes, and ``physx.clone()``
+        # re-populates env_1..N in the physics runtime with proper clone lineage (which is what the
+        # binding fast path expects). Features that need distinct authored physics in every
+        # environment request the full stage; missing heterogeneous clone targets are materialized
+        # in its flattened layer.
         cls._rearm_pending_clones()
-        stage_usda = cls._serialize_selected_stage(sim.stage)
+        stage_usda = cls._serialize_selected_stage(sim.stage, sim.get_clone_plan())
         cls._stage_usda = stage_usda
 
         if cls._physx is None:

@@ -39,6 +39,20 @@ def _register_ovphysx_schemas_before_test_stages():
     OvPhysxManager._prepare_stage_creation()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_shared_stage_usda():
+    """Drop the shared host-stage serialization between tests.
+
+    It is process-wide and refuses to serialize a second stage, which is the point in production
+    (one simulation, one stage) but would make each test here inherit the previous test's stage.
+    """
+    from isaaclab_ov.stage_usda import shared_stage_usda
+
+    shared_stage_usda().invalidate()
+    yield
+    shared_stage_usda().invalidate()
+
+
 def _make_two_environment_stage():
     """Create an in-memory USD stage with one cube in each of two environments."""
     from pxr import Usd
@@ -56,7 +70,7 @@ def _serialize_full_stage_with_pending_clones(stage) -> str:
     previous = OvPhysxManager._requires_full_stage
     try:
         OvPhysxManager._requires_full_stage = True
-        return OvPhysxManager._serialize_selected_stage(stage)
+        return OvPhysxManager._serialize_selected_stage(stage, None)
     finally:
         OvPhysxManager._requires_full_stage = previous
 
@@ -81,7 +95,7 @@ def test_manager_full_stage_requirement_preserves_authored_environments():
     previous = OvPhysxManager._requires_full_stage
     try:
         OvPhysxManager._requires_full_stage = True
-        usda = OvPhysxManager._serialize_selected_stage(stage)
+        usda = OvPhysxManager._serialize_selected_stage(stage, None)
         layer = Sdf.Layer.CreateAnonymous("full.usda")
         assert layer.ImportFromString(usda)
         exported = Usd.Stage.Open(layer)
@@ -417,21 +431,29 @@ def test_manager_supports_pinned_runtime_api(tmp_path, device, gpu_index, expect
     assert physx.calls == [("step_sync", 0.02), ("reset_stage",), ("wait_op", 23)]
 
 
-def test_manager_serializes_env0_only_stage_in_memory(caplog):
-    """The OVPhysX input keeps globals and env 0 without writing cloned envs."""
+def test_manager_serializes_clone_plan_prototypes_only():
+    """The OVPhysX input keeps globals and the plan's prototypes without writing cloned envs."""
+    import numpy as np
     from isaaclab_ov.physics import OvPhysxManager
 
     from pxr import Sdf, Usd, UsdGeom
 
+    from isaaclab.cloner import ClonePlan
+
     stage = Usd.Stage.CreateInMemory()
     for path in ("/World/Ground", "/World/envs/env_0/Cube", "/World/envs/env_1/Cube"):
         UsdGeom.Xform.Define(stage, path)
+    clone_plan = ClonePlan(
+        sources=("/World/envs/env_0",),
+        destinations=("/World/envs/env_0", "/World/envs/env_1"),
+        clone_mask=np.ones((1, 2), dtype=bool),
+        env_ids=np.arange(2, dtype=np.int32),
+    )
 
     previous = OvPhysxManager._requires_full_stage
     try:
         OvPhysxManager._requires_full_stage = False
-        with caplog.at_level(logging.INFO, logger=OvPhysxManager.__module__):
-            usda = OvPhysxManager._serialize_selected_stage(stage)
+        usda = OvPhysxManager._serialize_selected_stage(stage, clone_plan)
     finally:
         OvPhysxManager._requires_full_stage = previous
     layer = Sdf.Layer.CreateAnonymous("filtered.usda")
@@ -441,14 +463,13 @@ def test_manager_serializes_env0_only_stage_in_memory(caplog):
     assert filtered.GetPrimAtPath("/World/Ground").IsValid()
     assert filtered.GetPrimAtPath("/World/envs/env_0/Cube").IsValid()
     assert not filtered.GetPrimAtPath("/World/envs/env_1").IsValid()
-    assert "stripped 1 env_<i!=0> subtrees from in-memory USD" in caplog.text
 
 
-def test_manager_logs_when_serialized_stage_has_no_envs(caplog):
-    """The in-memory serializer diagnoses stages without the standard env namespace."""
+def test_manager_serializes_a_stage_without_the_env_namespace():
+    """A stage built without ``InteractiveScene`` has no envs to trim and survives serialization."""
     from isaaclab_ov.physics import OvPhysxManager
 
-    from pxr import Usd, UsdGeom
+    from pxr import Sdf, Usd, UsdGeom
 
     stage = Usd.Stage.CreateInMemory()
     UsdGeom.Xform.Define(stage, "/World/Ground")
@@ -456,12 +477,13 @@ def test_manager_logs_when_serialized_stage_has_no_envs(caplog):
     previous = OvPhysxManager._requires_full_stage
     try:
         OvPhysxManager._requires_full_stage = False
-        with caplog.at_level(logging.DEBUG, logger=OvPhysxManager.__module__):
-            OvPhysxManager._serialize_selected_stage(stage)
+        usda = OvPhysxManager._serialize_selected_stage(stage, None)
     finally:
         OvPhysxManager._requires_full_stage = previous
 
-    assert "no cloned environments to strip — serialized stage as-is" in caplog.text
+    layer = Sdf.Layer.CreateAnonymous("uncloned.usda")
+    assert layer.ImportFromString(usda)
+    assert Usd.Stage.Open(layer).GetPrimAtPath("/World/Ground").IsValid()
 
 
 def test_manager_attaches_and_releases_owned_ovstage(monkeypatch):
@@ -1121,7 +1143,6 @@ def test_manager_returns_none_when_backend_uninitialized():
 
 def test_setup_continues_when_create_tensor_binding_raises(monkeypatch, caplog):
     """A single failed binding-creation logs a warning and skips that pattern; others proceed."""
-    import logging
 
     from isaaclab_ov.physics.ovphysx_manager import OvPhysxSceneDataBackend
 
@@ -1169,7 +1190,6 @@ def test_setup_continues_when_create_tensor_binding_raises(monkeypatch, caplog):
 
 def test_transforms_logs_warning_when_a_binding_read_fails(caplog):
     """A failed ``binding.read(dst)`` logs and skips that binding; other bindings still merge."""
-    import logging
 
     import warp as _wp
 
