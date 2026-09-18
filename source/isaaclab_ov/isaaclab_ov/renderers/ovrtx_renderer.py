@@ -99,7 +99,6 @@ from isaaclab_ov.stage import (
     SharedOvStage,
     points_tensor_from_warp,
     xform_tensor_from_numpy,
-    xform_tensor_from_warp,
 )
 from isaaclab_ov.stage_usda import shared_stage_usda
 
@@ -2379,6 +2378,44 @@ class OVRTXRenderer(BaseRenderer):
 
         return None, None
 
+    def _author_xforms_ovstage(self, query, transforms: wp.array) -> None:
+        """Author ``omni:xform`` for ``query`` by filling the mapped column.
+
+        The column is mapped and filled rather than handed over as a tensor. A handover is
+        accepted and stored -- it reads back correctly, and so does the world matrix computed from
+        it -- but on a stage whose population includes the physics domain it never reaches the
+        render, leaving the prim drawn at its pre-write transform or not at all. Filling the mapped
+        column is picked up, and measures cheaper besides, so both populations take this path.
+
+        Args:
+            query: Prims to author, in the order ``transforms`` supplies them.
+            transforms: One world transform per prim in ``query``.
+        """
+        # Map groups expose the column as flat lanes rather than a (N, 4, 4) write shape, so the
+        # matrices are copied through a scalar view of the same device memory.
+        scalars = wp.array(
+            ptr=transforms.ptr,
+            dtype=wp.float64,
+            shape=(transforms.shape[0] * 16,),
+            device=transforms.device,
+        )
+        mapping = self._stage.map_attribute(
+            query,
+            "omni:xform",
+            ordinal=self._current_ordinal,
+            semantic=ovstage.AttributeSemantic.MATRIX,
+        )
+        mapping.wait()
+        try:
+            offset = 0
+            for group in mapping.groups():
+                for index in range(group.tensor_count):
+                    destination = wp.from_dlpack(group.array(index))
+                    wp.copy(destination, scalars[offset : offset + destination.size])
+                    offset += destination.size
+        finally:
+            mapping.unmap().wait()
+
     def _update_transforms_ovstage(self) -> None:
         if self._object_xform_query is None or self._object_scales is None:
             return
@@ -2397,22 +2434,7 @@ class OVRTXRenderer(BaseRenderer):
             inputs=[object_transforms, body_rows, body_q, self._object_scales],
             device=self._device,
         )
-        # The tensor is handed over zero-copy, so ovstage reads ``object_transforms`` in place and
-        # must not do so until the kernel above has landed. Passing the producing Warp stream as
-        # ``cuda_stream`` gives producer ordering: ovstage drains the work already queued on that
-        # stream before it touches the tensor. That replaces the device-wide
-        # ``wp.synchronize_device()`` with stream-scoped ordering and removes the host copy; it is
-        # not a nonblocking handoff, and the ``.wait()`` below can still block the calling thread.
-        # A GPU-side wait would need the event-based API instead.
-        self._stage.write_attribute(
-            self._object_xform_query,
-            "omni:xform",
-            ordinal=self._current_ordinal,
-            tensors=xform_tensor_from_warp(object_transforms),
-            is_array=False,
-            semantic=ovstage.AttributeSemantic.MATRIX,
-            cuda_stream=self._warp_device.stream.cuda_stream,
-        ).wait()
+        self._author_xforms_ovstage(self._object_xform_query, object_transforms)
 
     def _update_geometries_ovstage(self) -> None:
         if self._deformable_points_query is not None or self._particle_points_query is not None:
@@ -2529,16 +2551,7 @@ class OVRTXRenderer(BaseRenderer):
             device=self._device,
         )
         if self._camera_xform_query is not None:
-            # Stream-ordered zero-copy handoff, as for the object transforms above.
-            self._stage.write_attribute(
-                self._camera_xform_query,
-                "omni:xform",
-                ordinal=self._current_ordinal,
-                tensors=xform_tensor_from_warp(camera_transforms),
-                is_array=False,
-                semantic=ovstage.AttributeSemantic.MATRIX,
-                cuda_stream=self._warp_device.stream.cuda_stream,
-            ).wait()
+            self._author_xforms_ovstage(self._camera_xform_query, camera_transforms)
 
     def _render_ovstage(self, render_data: OVRTXRenderData) -> None:
         if not self._initialized_scene:
