@@ -694,3 +694,50 @@ def test_ovrtx_close_is_idempotent():
     renderer.close()
 
     assert events == []
+
+
+@pytest.mark.parametrize("newton_is_manager", [True, False])
+def test_ovstage_pose_source_follows_the_simulating_backend(monkeypatch, newton_is_manager):
+    """The renderer asks for a Newton model, so one exists under OVPhysX too.
+
+    Picking the pose source by the model's presence would read OVPhysX's poses out of a backend
+    that is not simulating them, so the choice has to follow the physics manager instead.
+    """
+    newton_physics = pytest.importorskip("isaaclab_newton.physics")
+
+    class _OtherManager:
+        pass
+
+    manager = newton_physics.NewtonManager if newton_is_manager else _OtherManager
+    monkeypatch.setattr(
+        ovrtx_renderer_module,
+        "SimulationContext",
+        types.SimpleNamespace(instance=lambda: types.SimpleNamespace(physics_manager=manager)),
+    )
+    renderer = OVRTXRenderer.__new__(OVRTXRenderer)
+
+    assert renderer._newton_owns_poses() is newton_is_manager
+
+
+def test_ovstage_rereads_the_bound_scene_data_backend_every_frame():
+    """Reading the backend is what refreshes it, so a cached read would freeze the scene."""
+    renderer = OVRTXRenderer.__new__(OVRTXRenderer)
+    renderer._object_newton_indices = None
+    rows = wp.array([0, 1], dtype=wp.int32, device="cpu")
+    poses = wp.zeros(2, dtype=wp.transformf, device="cpu")
+    reads = []
+
+    class _Backend:
+        @property
+        def transforms(self):
+            reads.append(1)
+            return types.SimpleNamespace(transforms=poses)
+
+    renderer._object_scene_data_backend = _Backend()
+    renderer._object_scene_data_rows = rows
+
+    for _ in range(2):
+        got_poses, got_rows = renderer._object_body_poses_ovstage()
+        assert got_poses is poses
+        assert got_rows is rows
+    assert len(reads) == 2

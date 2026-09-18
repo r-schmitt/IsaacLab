@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from isaaclab_ppisp import PpispPipeline
 
     from isaaclab.renderers.base_renderer import VisualMaterialBatch
+    from isaaclab.scene_data import SceneDataBackend
     from isaaclab.sensors.camera.camera_data import CameraData
     from isaaclab.utils.warp import ProxyArray
 
@@ -1828,6 +1829,11 @@ class OVRTXRenderer(BaseRenderer):
         self._camera_paths_list = None
         self._object_xform_query = None
         self._object_paths_list = None
+        # Set instead of ``_object_newton_indices`` when poses come from the scene-data backend
+        # rather than from Newton's state: the backend this reads each frame, and the rows of its
+        # merged transform array that the bound prims correspond to.
+        self._object_scene_data_backend: SceneDataBackend | None = None
+        self._object_scene_data_rows: wp.array | None = None
         self._deformable_points_query = None
         self._deformable_paths_list = None
         self._particle_points_query = None
@@ -2021,34 +2027,119 @@ class OVRTXRenderer(BaseRenderer):
         self._stage_paths.destroy_path_list(cam_paths_list)
         logger.info("Written omni:scenePartition to %d cameras", num_envs)
 
-    def _setup_xform_bindings_ovstage(self) -> None:
-        """Setup OVRTX bindings for scene objects to sync with Newton physics (ovstage path)."""
+    def _is_dynamic_render_body(self, path: str) -> bool:
+        """Return whether ``path`` is a per-environment body whose pose this renderer should follow.
+
+        Camera prims get their pose from :meth:`update_camera` and the ground plane never moves, so
+        neither wants a physics-driven transform written over it.
+
+        Args:
+            path: Body prim path as the physics backend labels it.
+        """
+        return "/World/envs/" in path and self._camera_rel_path not in path and "GroundPlane" not in path
+
+    def _newton_owns_poses(self) -> bool:
+        """Return whether Newton is the physics manager driving this simulation.
+
+        Presence of a Newton model is not the same question: this renderer asks for one through
+        ``requires_newton_model``, so a model exists under OVPhysX too, and reading poses from it
+        there would route them through a backend that is not simulating them.
+        """
         try:
             from isaaclab_newton.physics import NewtonManager
         except ImportError:
-            logger.debug("NewtonManager not available, skipping object bindings")
-            return
+            return False
+        sim = SimulationContext.instance()
+        if sim is None:
+            return False
+        # ``physics_manager`` is the manager *class*, not an instance.
+        manager = sim.physics_manager
+        return isinstance(manager, type) and issubclass(manager, NewtonManager)
 
-        if SimulationContext.instance() is None:
-            logger.info("No active simulation context, will not set up ovrtx object bindings for newton")
-            return
+    def _newton_body_rows_ovstage(self) -> tuple[list[str], list[int]]:
+        """Return bindable body paths and their rows in Newton's ``body_q``.
+
+        Returns:
+            The paths and their row indices, both empty when Newton is not the active backend.
+        """
+        try:
+            from isaaclab_newton.physics import NewtonManager
+        except ImportError:
+            logger.debug("NewtonManager not available, skipping Newton object bindings")
+            return [], []
 
         newton_model = NewtonManager.get_model()
         if newton_model is None:
-            logger.debug("Newton model not available, skipping object bindings")
-            return
+            logger.debug("Newton model not available, skipping Newton object bindings")
+            return [], []
 
         all_body_paths = getattr(newton_model, "body_label", None)
         if all_body_paths is None:
-            logger.info("Newton model has no body_label, skipping object bindings")
-            return
+            logger.info("Newton model has no body_label, skipping Newton object bindings")
+            return [], []
 
         object_paths = []
-        newton_indices = []
+        rows = []
         for idx, path in enumerate(all_body_paths):
-            if "/World/envs/" in path and self._camera_rel_path not in path and "GroundPlane" not in path:
+            if self._is_dynamic_render_body(path):
                 object_paths.append(path)
-                newton_indices.append(idx)
+                rows.append(idx)
+        return object_paths, rows
+
+    def _scene_data_body_rows_ovstage(self) -> tuple[list[str], list[int], SceneDataBackend | None]:
+        """Return bindable body paths, their rows in the scene-data backend, and that backend.
+
+        The backend-neutral source for a physics backend that publishes poses through
+        :class:`~isaaclab.scene_data.SceneDataBackend` instead of through Newton state, which is how
+        OVPhysX reaches this renderer. Only the ``wp.transformf`` publication is followed; a backend
+        using one of the other :class:`~isaaclab.scene_data.SceneDataFormat` variants is declined
+        here rather than misread per frame.
+
+        Returns:
+            The paths, their row indices, and the backend to read them from; empty and ``None`` when
+            no usable backend is published.
+        """
+        sim = SimulationContext.instance()
+        provider = sim.get_scene_data_provider() if sim is not None else None
+        backend = getattr(provider, "backend", None)
+        if backend is None:
+            logger.debug("No scene-data backend available, skipping object bindings")
+            return [], [], None
+
+        object_paths = []
+        rows = []
+        for idx, path in enumerate(backend.transform_paths):
+            if self._is_dynamic_render_body(path):
+                object_paths.append(path)
+                rows.append(idx)
+        if not object_paths:
+            return [], [], None
+
+        published = getattr(backend.transforms, "transforms", None)
+        if published is None or published.dtype is not wp.transformf:
+            logger.info(
+                "Scene-data backend %s does not publish wp.transformf transforms; skipping object bindings",
+                type(backend).__name__,
+            )
+            return [], [], None
+        return object_paths, rows, backend
+
+    def _setup_xform_bindings_ovstage(self) -> None:
+        """Bind the prims whose world transform the physics backend drives (ovstage path).
+
+        Newton publishes body poses through its own state; every other backend publishes them
+        through the scene-data backend. Whichever is present supplies the rows
+        :meth:`_update_transforms_ovstage` samples each frame.
+        """
+        if SimulationContext.instance() is None:
+            logger.info("No active simulation context, will not set up ovrtx object bindings")
+            return
+
+        scene_data_backend = None
+        if self._newton_owns_poses():
+            object_paths, rows = self._newton_body_rows_ovstage()
+        else:
+            object_paths, rows, scene_data_backend = self._scene_data_body_rows_ovstage()
 
         if len(object_paths) == 0:
             logger.info("No dynamic objects found for binding")
@@ -2056,6 +2147,8 @@ class OVRTXRenderer(BaseRenderer):
 
         self._object_paths_list = self._stage_paths.create_path_list_from_strings(object_paths)
         self._object_xform_query = self._stage.query_from_path_list(self._object_paths_list)
+        if self._object_xform_query is None:
+            raise RuntimeError("Failed to create OVRTX object bindings")
 
         self._stage.write_attribute(
             self._object_xform_query,
@@ -2065,10 +2158,12 @@ class OVRTXRenderer(BaseRenderer):
             is_array=False,
         ).wait()
 
-        if self._object_xform_query is None:
-            raise RuntimeError("Failed to create OVRTX object bindings")
-
-        self._object_newton_indices = wp.array(newton_indices, dtype=wp.int32, device=self._device)
+        row_array = wp.array(rows, dtype=wp.int32, device=self._device)
+        if scene_data_backend is None:
+            self._object_newton_indices = row_array
+        else:
+            self._object_scene_data_backend = scene_data_backend
+            self._object_scene_data_rows = row_array
         self._object_scales = self._create_object_scale_array(object_paths)
 
     def _setup_deformable_bindings_ovstage(self, num_envs: int) -> None:
@@ -2259,28 +2354,47 @@ class OVRTXRenderer(BaseRenderer):
         if self._particle_points_query is None:
             raise RuntimeError("Failed to create OVRTX particle point bindings")
 
+    def _object_body_poses_ovstage(self) -> tuple[wp.array | None, wp.array | None]:
+        """Return the body pose array to sample and the rows of it the bound prims map to.
+
+        Newton state and the scene-data backend both publish ``wp.transformf`` rows, so either is
+        sampled through the same kernel.
+
+        Returns:
+            The pose array and the row indices into it, both ``None`` when no pose source is bound.
+        """
+        if self._object_newton_indices is not None:
+            from isaaclab_newton.physics import NewtonManager
+
+            newton_state = NewtonManager.get_state()
+            if newton_state is None:
+                raise RuntimeError("Newton state should not be None")
+            return getattr(newton_state, "body_q", None), self._object_newton_indices
+
+        if self._object_scene_data_backend is not None:
+            # Reading the backend is what refreshes it -- it pulls each physics binding into its
+            # merged buffer -- so this has to happen every frame rather than be cached at setup.
+            published = self._object_scene_data_backend.transforms
+            return getattr(published, "transforms", None), self._object_scene_data_rows
+
+        return None, None
+
     def _update_transforms_ovstage(self) -> None:
-        if self._object_xform_query is None or self._object_newton_indices is None or self._object_scales is None:
+        if self._object_xform_query is None or self._object_scales is None:
             return
 
-        # If self._object_newton_indices is not None, then Newton's the current physics backend
-
-        from isaaclab_newton.physics import NewtonManager
-
-        newton_state = NewtonManager.get_state()
-        if newton_state is None:
-            raise RuntimeError("Newton state should not be None")
-
-        body_q = getattr(newton_state, "body_q", None)
-        if body_q is None:
+        body_q, body_rows = self._object_body_poses_ovstage()
+        if body_q is None or body_rows is None:
             return
 
-        num_objects = len(self._object_newton_indices)
+        num_objects = len(body_rows)
         object_transforms = wp.empty(num_objects, dtype=wp.mat44d, device=self._device)
+        # Named for Newton, but the math is backend-neutral: it composes a ``transformf`` row with
+        # the authored scale, which is equally what the scene-data backend publishes.
         wp.launch(
             kernel=sync_newton_transforms_kernel,
             dim=num_objects,
-            inputs=[object_transforms, self._object_newton_indices, body_q, self._object_scales],
+            inputs=[object_transforms, body_rows, body_q, self._object_scales],
             device=self._device,
         )
         # The tensor is handed over zero-copy, so ovstage reads ``object_transforms`` in place and
@@ -2509,6 +2623,10 @@ class OVRTXRenderer(BaseRenderer):
         self._cable_paths_list = None
 
         self._object_newton_indices = None
+        # Dropped with the rest of the pose bindings so the closed renderer stops holding the
+        # physics backend alive.
+        self._object_scene_data_backend = None
+        self._object_scene_data_rows = None
         self._object_scales = None
         self._object_scales_by_path = {}
         self._deformable_particle_offsets = []
