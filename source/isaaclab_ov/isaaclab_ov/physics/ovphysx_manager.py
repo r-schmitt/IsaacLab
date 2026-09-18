@@ -40,6 +40,7 @@ from isaaclab.scene_data.deformable_discovery import (
 from isaaclab_ov._clone import CloneTransform, clone_transforms_from_positions
 from isaaclab_ov._runtime import import_ovphysx
 from isaaclab_ov.cloner import OvPhysxReplicateContext
+from isaaclab_ov.ovstage_owner import ovstage_owner
 from isaaclab_ov.stage import SharedOvStage
 from isaaclab_ov.stage_usda import shared_stage_usda
 
@@ -698,32 +699,33 @@ class OvPhysxManager(PhysicsManager):
 
     @classmethod
     def _attach_ovstage(cls, stage_usda: str) -> None:
-        """Populate an OVStage from USDA text and attach it to the runtime."""
-        import ovstage  # noqa: PLC0415
+        """Attach the OVStage shared with this simulation's other consumers.
 
-        shared = SharedOvStage("isaaclab")
+        The stage is populated from ``stage_usda`` by whichever consumer acquires it first, so a
+        render consumer on the same stage neither populates it a second time nor keeps a second
+        resident copy of the scene. Environments are still replicated runtime-side by
+        :meth:`_replay_pending_clones` after attach: a clone authored on the stage instead is
+        realized, but OVPhysX's tensor bindings cannot address it, so every Isaac Lab view would
+        size itself to one environment.
+        """
+        owner = ovstage_owner()
+        shared = owner.acquire(stage_usda)
         try:
-            shared.populate_from_usda(
-                stage_usda,
-                # FIXME: Use PHYSICS once OVStage includes native-instance collider
-                # dependencies in physics-only population.
-                domains=ovstage.PopulationDomain.ALL,
-            )
-            # ovphysx reads sealed data only: population completes the writes but never
-            # commits the ordinal, so attaching at an unsealed ordinal fails the parse
-            # and silently yields an empty scene.
-            shared.seal(shared.population_ordinal)
             cls._physx.attach_ovstage(shared.stage, read_ordinal=shared.population_ordinal)
         except Exception:
-            shared.destroy()
+            owner.release()
             raise
         cls._ovstage = shared
 
     @classmethod
     def _destroy_ovstage(cls) -> None:
-        """Destroy the attached OVStage after PhysX has released its stage."""
+        """Release the shared OVStage after PhysX has released its stage.
+
+        The stage outlives this release when another consumer still holds it, and is destroyed
+        once the last one has left.
+        """
         if cls._ovstage is not None:
-            cls._ovstage.destroy()
+            ovstage_owner().release()
             cls._ovstage = None
 
     @staticmethod

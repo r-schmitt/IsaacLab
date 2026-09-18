@@ -41,16 +41,40 @@ def _register_ovphysx_schemas_before_test_stages():
 
 @pytest.fixture(autouse=True)
 def _fresh_shared_stage_usda():
-    """Drop the shared host-stage serialization between tests.
+    """Drop the shared host-stage serialization and OVStage between tests.
 
-    It is process-wide and refuses to serialize a second stage, which is the point in production
+    Both are process-wide and refuse to take on a second stage, which is the point in production
     (one simulation, one stage) but would make each test here inherit the previous test's stage.
+    The owner's state is cleared field-by-field rather than through ``release``, so a fake stage
+    left behind by a failed test does not record a teardown against the next one.
     """
+    from isaaclab_ov.ovstage_owner import ovstage_owner
     from isaaclab_ov.stage_usda import shared_stage_usda
 
-    shared_stage_usda().invalidate()
+    def _clear() -> None:
+        shared_stage_usda().invalidate()
+        owner = ovstage_owner()
+        owner._shared = None
+        owner._usda = None
+        owner._consumers = 0
+
+    _clear()
     yield
-    shared_stage_usda().invalidate()
+    _clear()
+
+
+def _install_shared_stage(stage) -> None:
+    """Register ``stage`` with the shared owner as though one consumer had acquired it.
+
+    Teardown tests drive ``_release_physx`` directly rather than going through a population, so
+    the owner has to be told about their fake stage or the release finds nothing to destroy.
+    """
+    from isaaclab_ov.ovstage_owner import ovstage_owner
+
+    owner = ovstage_owner()
+    owner._shared = stage
+    owner._usda = "#usda 1.0"
+    owner._consumers = 1
 
 
 def _make_two_environment_stage():
@@ -487,7 +511,8 @@ def test_manager_serializes_a_stage_without_the_env_namespace():
 
 
 def test_manager_attaches_and_releases_owned_ovstage(monkeypatch):
-    """The manager owns OVStage from population through PhysX release."""
+    """The manager holds the shared OVStage from population through PhysX release."""
+    import isaaclab_ov.ovstage_owner as oo_mod
     import isaaclab_ov.physics.ovphysx_manager as om_mod
     from isaaclab_ov.physics import OvPhysxManager
 
@@ -527,9 +552,10 @@ def test_manager_attaches_and_releases_owned_ovstage(monkeypatch):
     fake_ovstage = ModuleType("ovstage")
     fake_ovstage.PopulationDomain = SimpleNamespace(ALL="all")
     monkeypatch.setitem(sys.modules, "ovstage", fake_ovstage)
-    # The manager builds its stage through the shared wrapper, which owns stage configuration,
-    # the path dictionary, and the ordinal lanes; that is the seam to fake, not ``ovstage.Stage``.
-    monkeypatch.setattr(om_mod, "SharedOvStage", FakeSharedStage)
+    # The stage is built by the shared owner through the ``SharedOvStage`` wrapper, which holds
+    # stage configuration, the path dictionary, and the ordinal lanes; that is the seam to fake,
+    # not ``ovstage.Stage``.
+    monkeypatch.setattr(oo_mod, "SharedOvStage", FakeSharedStage)
 
     previous_physx = OvPhysxManager._physx
     previous_ovstage = getattr(OvPhysxManager, "_ovstage", None)
@@ -632,6 +658,7 @@ def test_manager_releases_legacy_owners_after_release_error(monkeypatch):
     previous_ovstage = OvPhysxManager._ovstage
     OvPhysxManager._physx = FakePhysX()
     OvPhysxManager._ovstage = FakeStage()
+    _install_shared_stage(OvPhysxManager._ovstage)
     monkeypatch.setattr(OvPhysxManager, "_close_physx_views", staticmethod(lambda value: events.append("close_views")))
     try:
         with pytest.raises(RuntimeError, match="legacy release failed"):
@@ -682,6 +709,7 @@ def test_manager_retries_current_destroy_before_releasing_owners(monkeypatch):
     previous_ovstage = OvPhysxManager._ovstage
     OvPhysxManager._physx = physx
     OvPhysxManager._ovstage = stage
+    _install_shared_stage(stage)
     monkeypatch.setattr(OvPhysxManager, "_close_physx_views", staticmethod(lambda value: events.append("close_views")))
     try:
         with pytest.raises(RuntimeError, match="did not reach native teardown"):
@@ -746,6 +774,7 @@ def test_manager_releases_owners_after_terminal_destroy_error(monkeypatch):
     previous_ovstage = OvPhysxManager._ovstage
     OvPhysxManager._physx = FakePhysX()
     OvPhysxManager._ovstage = FakeStage()
+    _install_shared_stage(OvPhysxManager._ovstage)
     monkeypatch.setattr(OvPhysxManager, "_close_physx_views", staticmethod(lambda value: None))
     try:
         with pytest.raises(RuntimeError, match="terminal failure"):
@@ -761,7 +790,7 @@ def test_manager_releases_owners_after_terminal_destroy_error(monkeypatch):
 
 def test_manager_destroys_ovstage_when_population_fails(monkeypatch):
     """A failed in-memory population does not leak its OVStage allocation."""
-    import isaaclab_ov.physics.ovphysx_manager as om_mod
+    import isaaclab_ov.ovstage_owner as oo_mod
     from isaaclab_ov.physics import OvPhysxManager
 
     destroyed = []
@@ -779,7 +808,7 @@ def test_manager_destroys_ovstage_when_population_fails(monkeypatch):
     fake_ovstage = ModuleType("ovstage")
     fake_ovstage.PopulationDomain = SimpleNamespace(ALL="all")
     monkeypatch.setitem(sys.modules, "ovstage", fake_ovstage)
-    monkeypatch.setattr(om_mod, "SharedOvStage", FakeSharedStage)
+    monkeypatch.setattr(oo_mod, "SharedOvStage", FakeSharedStage)
 
     previous_ovstage = getattr(OvPhysxManager, "_ovstage", None)
     OvPhysxManager._ovstage = None
@@ -791,6 +820,9 @@ def test_manager_destroys_ovstage_when_population_fails(monkeypatch):
         OvPhysxManager._ovstage = previous_ovstage
 
     assert destroyed == ["isaaclab"]
+    # A population that never completed must leave no consumer registered, or the next acquire
+    # would hand back a stage nobody populated.
+    assert oo_mod.ovstage_owner().consumer_count == 0
 
 
 def test_manager_keeps_kit_physx_provider_and_registers_deformable_schema(monkeypatch, tmp_path):
