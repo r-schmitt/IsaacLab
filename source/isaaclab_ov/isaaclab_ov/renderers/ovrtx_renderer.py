@@ -101,6 +101,7 @@ from isaaclab_ov.stage import (
     xform_tensor_from_numpy,
     xform_tensor_from_warp,
 )
+from isaaclab_ov.stage_usda import shared_stage_usda
 
 if TYPE_CHECKING:
     from isaaclab_ppisp import PpispPipeline
@@ -393,7 +394,12 @@ class OVRTXRenderer(BaseRenderer):
         return self._create_visual_material_writer
 
     def prepare_cameras(self, stage: Any, spec: CameraRenderSpec) -> None:
-        """Resolve the camera's PPISP cfg and apply OVRTX-specific USD overrides.
+        """Declare this camera's render product and apply OVRTX-specific USD overrides.
+
+        On the ovstage path the render product is contributed to the shared host-stage
+        serialization here, which is the earliest point the renderer knows a camera's resolution
+        and outputs. It has to be this early: physics resolves that serialization when it warms up,
+        and a contribution made after that cannot reach it.
 
         When ``spec.cfg.isp_cfg`` is set, resolves it (sentinel discovery +
         normalization) via :func:`isaaclab_ppisp.resolve_and_normalize` so
@@ -402,6 +408,9 @@ class OVRTXRenderer(BaseRenderer):
         the RTX exposure model OVRTX embeds does not compound on top of the
         ISP. Without an ISP, the camera prim's authored exposure is left alone.
         """
+        if self._use_ovstage:
+            self._contribute_render_product(spec)
+
         if spec.cfg.isp_cfg is None:
             return
         try:
@@ -415,11 +424,55 @@ class OVRTXRenderer(BaseRenderer):
             return
         apply_rtx_exposure_overrides(stage, list(spec.camera_prim_paths))
 
+    def _contribute_render_product(self, spec: CameraRenderSpec) -> None:
+        """Add ``spec``'s render product to the shared host-stage serialization.
+
+        A render product describes how this renderer draws the scene rather than the scene itself,
+        so it is contributed to the serialization instead of authored onto the host USD stage where
+        every other consumer would see it.
+
+        Only the first camera is declared, because only the first camera's spec initializes the
+        scene: :meth:`create_render_data` renders every environment of one camera into a single
+        tiled product, and a second camera on this renderer reuses it.
+
+        Args:
+            spec: Camera description whose render product is declared.
+        """
+        if self._render_product_paths:
+            return
+
+        data_types = self._resolve_data_types(spec)
+        render_product_string, render_product_path = build_render_product_as_string(
+            width=spec.cfg.width,
+            height=spec.cfg.height,
+            num_envs=spec.num_instances,
+            data_types=data_types,
+            minimal_mode=_resolve_rtx_minimal_mode(data_types),
+            camera_rel_path=spec.camera_path_relative_to_env_0,
+            # Pinned to the device the spec names, matching the Warp kernels that read the render
+            # vars. Resolved through Warp here rather than reusing ``_warp_device``, which
+            # ``create_render_data`` does not set until well after this runs.
+            device_id=wp.get_device(spec.device).ordinal,
+            enable_shadows=self.cfg.enable_shadows,
+        )
+        shared_stage_usda().contribute(render_product_string)
+        self._render_product_paths.append(render_product_path)
+
+    @staticmethod
+    def _resolve_data_types(spec: CameraRenderSpec) -> list[str]:
+        """Return the render var types for ``spec``, including the HDR AOV that PPISP reads from."""
+        data_types = spec.cfg.data_types if spec.cfg.data_types else ["rgb"]
+        if spec.cfg.isp_cfg is not None and "rgb_hdr" not in data_types:
+            data_types = [*data_types, "rgb_hdr"]
+        return data_types
+
     def prepare_stage(self, stage: Any, num_envs: int) -> None:
         """Prepare the USD stage for OVRTX before :meth:`create_render_data`.
 
-        Adds scene partition attributes and exports the stage to a string held on the renderer until
-        :meth:`create_render_data` is called.
+        Authors scene partition attributes and records the composed object scales. On the legacy
+        path it also exports the stage to a string held on the renderer until
+        :meth:`create_render_data` is called; the ovstage path takes the shared serialization then
+        instead, so that it also carries whatever physics authors between here and its warmup.
         """
         if stage is None:
             return
@@ -440,13 +493,16 @@ class OVRTXRenderer(BaseRenderer):
         # Composed scales must be read while the full stage is still live, before export trims it.
         self._capture_object_scales(stage, self._clone_plan)
 
+        if self._use_ovstage:
+            return
+
         # The clone plan already identifies every source row. Keep those rows independent so
         # backend bindings for dynamic assets retain the paths they were compiled against.
         self._exported_usd_string = export_stage_to_string(
             stage,
             num_envs,
             source_paths=self._clone_plan.sources,
-            keep_env_roots=not self._use_ovstage,
+            keep_env_roots=True,
         )
 
     def _capture_object_scales(self, stage: Any, plan: ClonePlan) -> None:
@@ -529,9 +585,7 @@ class OVRTXRenderer(BaseRenderer):
         width = spec.cfg.width
         height = spec.cfg.height
         num_envs = spec.num_instances
-        data_types = spec.cfg.data_types if spec.cfg.data_types else ["rgb"]
-        if spec.cfg.isp_cfg is not None and "rgb_hdr" not in data_types:
-            data_types = [*data_types, "rgb_hdr"]
+        data_types = self._resolve_data_types(spec)
 
         env_0_prefix = "/World/envs/env_0/"
         first_cam_path = spec.camera_prim_paths[0]
@@ -1746,6 +1800,10 @@ class OVRTXRenderer(BaseRenderer):
         """Release the shared stage state. See :meth:`~isaaclab.renderers.base_renderer.BaseRenderer.close`."""
         if self._use_ovstage:
             self._close_ovstage()
+            # Drop the shared serialization for this stage. OVPhysX does the same when it closes,
+            # but it is not always there: OVRTX also runs on Newton, and nothing else would clear
+            # the contributions naming prims on a stage that is going away.
+            shared_stage_usda().invalidate()
         else:
             self._close_legacy()
         self._visual_material_writer_ref = None
@@ -1785,12 +1843,7 @@ class OVRTXRenderer(BaseRenderer):
         Args:
             spec: Tiled camera description (resolution, paths, data types).
         """
-        width = spec.cfg.width
-        height = spec.cfg.height
         num_envs = spec.num_instances
-        data_types = spec.cfg.data_types if spec.cfg.data_types else ["rgb"]
-        if spec.cfg.isp_cfg is not None and "rgb_hdr" not in data_types:
-            data_types = [*data_types, "rgb_hdr"]
 
         env_0_prefix = "/World/envs/env_0/"
         first_cam_path = spec.camera_prim_paths[0]
@@ -1798,25 +1851,16 @@ class OVRTXRenderer(BaseRenderer):
             raise RuntimeError(f"Expected camera prim under '{env_0_prefix}', got '{first_cam_path}'")
         self._camera_rel_path = spec.camera_path_relative_to_env_0
 
-        logger.info("Injecting camera definitions...")
+        if not self._render_product_paths:
+            raise RuntimeError("Expected a render product declared by prepare_cameras")
+        render_product_path = self._render_product_paths[0]
 
-        if self._exported_usd_string is None:
-            raise RuntimeError("Expected an exported USD string from stage")
-
-        render_product_string, render_product_path = build_render_product_as_string(
-            width=width,
-            height=height,
-            num_envs=num_envs,
-            data_types=data_types,
-            minimal_mode=_resolve_rtx_minimal_mode(data_types),
-            camera_rel_path=self._camera_rel_path,
-            device_id=self._warp_device.ordinal,
-            enable_shadows=self.cfg.enable_shadows,
+        # The serialization physics already populated from, so both consumers see one scene. It
+        # carries the render product contributed by prepare_cameras.
+        combined_usd_string = shared_stage_usda().resolve(
+            SimulationContext.instance().stage,
+            self._clone_plan,
         )
-        self._render_product_paths.append(render_product_path)
-
-        combined_usd_string = self._exported_usd_string + "\n\n" + render_product_string
-        self._exported_usd_string = None  # Free memory
 
         # If temp_usd_dir is set, write the combined USD stage to a temporary file.
         if self.cfg.temp_usd_dir is not None:

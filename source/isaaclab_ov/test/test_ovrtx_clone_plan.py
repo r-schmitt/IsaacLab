@@ -568,3 +568,39 @@ def test_prepare_stage_stores_clone_plan_and_exports(monkeypatch: pytest.MonkeyP
     # Only the env_0 source subtree keeps content; legacy OVRTX still needs every root for xform writes.
     _assert_export_contains_env_roots_and_children(renderer._exported_usd_string, [0])
     _assert_export_contains_empty_env_roots(renderer._exported_usd_string, [1, 2, 3])
+
+
+def test_prepare_stage_defers_to_the_shared_serialization_on_the_ovstage_path(monkeypatch: pytest.MonkeyPatch):
+    """The ovstage path exports nothing of its own, so physics and OVRTX populate from one string."""
+    from isaaclab_ov.stage_usda import shared_stage_usda
+
+    num_envs = 4
+    published = ClonePlan(
+        sources=("/World/envs/env_0",),
+        destinations=("/World/envs/env_{}",),
+        clone_mask=np.ones((1, num_envs), dtype=np.bool_),
+        env_ids=np.arange(num_envs, dtype=np.int64),
+        positions=np.zeros((num_envs, 3), dtype=np.float32),
+    )
+    _patch_simulation_context(monkeypatch, published)
+
+    stage = _make_multi_env_stage(num_envs)
+    renderer = _make_ovrtx_renderer_without_backend()
+    renderer._use_ovstage = True
+
+    shared_stage_usda().invalidate()
+    try:
+        renderer.prepare_cameras(stage, _make_camera_render_spec(num_envs=num_envs))
+        renderer.prepare_stage(stage, num_envs)
+
+        assert renderer._exported_usd_string is None
+        # The render product is declared while the scene is built, because physics resolves the
+        # serialization when it warms up and a later contribution could not reach it.
+        assert renderer._render_product_paths == ["/Render/RenderProduct"]
+        usda = shared_stage_usda().resolve(stage, published)
+        assert "RenderProduct" in usda
+        # Non-source env roots are gone: ``stage.clone`` recreates them.
+        _assert_export_contains_env_roots_and_children(usda, [0])
+        assert '"env_1"' not in usda
+    finally:
+        shared_stage_usda().invalidate()

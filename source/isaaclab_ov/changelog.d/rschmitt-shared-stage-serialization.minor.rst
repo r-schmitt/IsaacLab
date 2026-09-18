@@ -18,3 +18,9 @@ Changed
   Environments are still replicated in the physics runtime through ``physx.clone()``, so the
   ingestion cost of a large environment count is unchanged. A full-stage load, which
   :class:`~isaaclab_ov.assets.DeformableObject` requests, keeps its own flattened export.
+* Changed the OVRTX renderer's OVStage path to populate from the shared serialization rather than
+  exporting the stage itself, so enabling it through ``ISAAC_LAB_OVRTX_USE_OVSTAGE`` now costs one
+  export and one USD parse instead of two. Its render product is declared while the scene is built,
+  early enough to reach the serialization before physics warms up, and the population therefore
+  also carries what physics authors between scene construction and its warmup. The legacy path is
+  unchanged and still exports on its own.
