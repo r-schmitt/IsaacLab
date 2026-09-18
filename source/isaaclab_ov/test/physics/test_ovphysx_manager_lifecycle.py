@@ -47,7 +47,7 @@ def manager_module(monkeypatch):
         "_physx": None,
         "_ovstage": None,
         "_stage_usda": None,
-        "_next_control_ordinal": 2,
+        "_ordinals": None,
         "_warmup_done": False,
         "_requires_full_stage": False,
         "_locked_device": None,
@@ -325,6 +325,7 @@ def test_set_gravity_writes_and_releases_ovstage_control_resources(monkeypatch, 
     fake_ovstage.PathDictionary = FakePathDictionary
     monkeypatch.setitem(sys.modules, "ovstage", fake_ovstage)
     monkeypatch.setattr(manager, "_ovstage", FakeStage())
+    monkeypatch.setattr(manager, "_ordinals", manager_module.OvStageOrdinalLanes())
     monkeypatch.setattr(manager, "_physx", FakePhysX())
     monkeypatch.setattr(
         manager,

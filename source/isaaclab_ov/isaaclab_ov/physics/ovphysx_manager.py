@@ -40,6 +40,7 @@ from isaaclab.scene_data.deformable_discovery import (
 from isaaclab_ov._clone import CloneTransform, clone_transforms_from_positions
 from isaaclab_ov._runtime import import_ovphysx
 from isaaclab_ov.cloner import OvPhysxReplicateContext
+from isaaclab_ov.ovstage_ordinals import POPULATION_ORDINAL, OvStageOrdinalLanes
 from isaaclab_ov.stage import create_ovstage
 
 from .ovphysx_compat import OVPHYSX_LIFECYCLE_ENTRY_POINTS
@@ -409,7 +410,8 @@ class OvPhysxManager(PhysicsManager):
     _ovstage: ClassVar[Any] = None
     _stage_usda: ClassVar[str | None] = None
     _warmup_done: ClassVar[bool] = False
-    _next_control_ordinal: ClassVar[int] = 2
+    # Ordinal lanes for the attached stage, or ``None`` while no stage is attached.
+    _ordinals: ClassVar[OvStageOrdinalLanes | None] = None
     _requires_full_stage: ClassVar[bool] = False
     # Device mode is process-wide; later contexts must reuse the first selected device.
     _locked_device: ClassVar[str | None] = None
@@ -701,7 +703,7 @@ class OvPhysxManager(PhysicsManager):
             ovstage.population.open_usd_from_string(
                 stage,
                 stage_usda,
-                ordinal=1,
+                ordinal=POPULATION_ORDINAL,
                 # FIXME: Use PHYSICS once OVStage includes native-instance collider
                 # dependencies in physics-only population.
                 domains=ovstage.PopulationDomain.ALL,
@@ -709,14 +711,14 @@ class OvPhysxManager(PhysicsManager):
             # ovphysx reads sealed data only: population completes the writes but never
             # commits the ordinal, so attaching at an unsealed ordinal fails the parse
             # and silently yields an empty scene.
-            stage.advance_write_floor(ordinal=1).wait()
-            cls._physx.attach_ovstage(stage, read_ordinal=1)
+            stage.advance_write_floor(ordinal=POPULATION_ORDINAL).wait()
+            cls._physx.attach_ovstage(stage, read_ordinal=POPULATION_ORDINAL)
         except Exception:
             stage.destroy()
             raise
         cls._ovstage = stage
 
-        cls._next_control_ordinal = 2
+        cls._ordinals = OvStageOrdinalLanes(POPULATION_ORDINAL)
 
     @classmethod
     def _destroy_ovstage(cls) -> None:
@@ -725,7 +727,7 @@ class OvPhysxManager(PhysicsManager):
             cls._ovstage.destroy()
             cls._ovstage = None
 
-        cls._next_control_ordinal = 2
+        cls._ordinals = None
 
     @staticmethod
     def _close_physx_views(physx: Any) -> None:
@@ -782,7 +784,7 @@ class OvPhysxManager(PhysicsManager):
             RuntimeError: If the OVPhysX simulation has not been initialized.
             ValueError: If gravity does not contain three finite values.
         """
-        if cls._sim is None or cls._physx is None or cls._ovstage is None:
+        if cls._sim is None or cls._physx is None or cls._ovstage is None or cls._ordinals is None:
             raise RuntimeError("OvPhysxManager has not been initialized yet.")
 
         gravity_array = np.asarray(gravity, dtype=np.float32)
@@ -794,8 +796,7 @@ class OvPhysxManager(PhysicsManager):
             direction = np.array([[0.0, 0.0, -1.0]], dtype=np.float32)
         else:
             direction = (gravity_array / magnitude).reshape(1, 3)
-        ordinal = cls._next_control_ordinal
-        cls._next_control_ordinal += 1
+        ordinal = cls._ordinals.next_control()
 
         import ovstage  # noqa: PLC0415
 
@@ -809,7 +810,7 @@ class OvPhysxManager(PhysicsManager):
                 query, "physics:gravityMagnitude", ordinal, np.array([magnitude], dtype=np.float32), is_array=False
             ).wait()
             cls._ovstage.advance_write_floor(ordinal=ordinal).wait()
-            cls._physx.update_from_ovstage(ordinal, ordinal)
+            cls._physx.update_from_ovstage(*cls._ordinals.drain_range(ordinal))
 
         # Only publish once the ordinal has been applied, so a failed write leaves
         # :meth:`get_gravity` reporting the gravity the scene is still running with.
