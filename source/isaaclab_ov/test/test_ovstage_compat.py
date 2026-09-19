@@ -28,15 +28,19 @@ pytestmark = [
 if not _MISSING_MODULES:
     from isaaclab_ov.ovstage_compat import (  # noqa: E402
         HIERARCHY_COMPUTATION_MODEL,
+        XFORM_HANDOVER,
         detect_ovstage_version,
         resolve_hierarchy_computation_model,
         supports_gpu_hierarchy_computation,
+        supports_xform_handover,
     )
 else:
     HIERARCHY_COMPUTATION_MODEL = None
+    XFORM_HANDOVER = None
     detect_ovstage_version = None
     resolve_hierarchy_computation_model = None
     supports_gpu_hierarchy_computation = None
+    supports_xform_handover = None
 
 
 def test_detect_ovstage_version_reads_distribution_metadata(monkeypatch: pytest.MonkeyPatch):
@@ -82,6 +86,27 @@ def test_ovstage_01_uses_the_host_hierarchy_model(version: Version | None):
 @pytest.mark.parametrize("version", [Version("0.2"), Version("0.2.0.377349"), Version("1.0")])
 def test_ovstage_02_uses_the_device_hierarchy_model(version: Version):
     assert resolve_hierarchy_computation_model(version) == "GPU_INCREMENTAL"
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        (None, False),
+        (Version("0.1.1.355824"), False),
+        (Version("0.1.2"), False),
+        (Version("0.2"), True),
+        (Version("0.2.0.377349"), True),
+        (Version("1.0"), True),
+    ],
+)
+def test_supports_xform_handover_switches_at_ovstage_02(version: Version | None, expected: bool):
+    """OVStage 0.1 stores a handover to a physics-domain prim without rendering it."""
+    assert supports_xform_handover(version) is expected
+
+
+def test_installed_xform_mechanism_matches_the_installed_version():
+    """The published flag is baked from the installed OVStage version at import."""
+    assert supports_xform_handover(detect_ovstage_version()) is XFORM_HANDOVER
 
 
 def test_installed_model_matches_the_installed_version():

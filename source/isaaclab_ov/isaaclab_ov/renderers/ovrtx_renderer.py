@@ -72,6 +72,7 @@ from isaaclab.renderers import BaseRenderer, RenderBufferKind, RenderBufferSpec
 from isaaclab.sim import SimulationContext
 from isaaclab.utils.warp.warp_math import convert_camera_frame_orientation_convention_wp
 
+from isaaclab_ov.ovstage_compat import XFORM_HANDOVER
 from isaaclab_ov.ovstage_owner import ovstage_owner
 from isaaclab_ov.renderers.ovrtx_annotator_utils import (
     build_instance_id_to_labels_and_semantics,
@@ -101,6 +102,7 @@ from isaaclab_ov.stage import (
     SharedOvStage,
     points_tensor_from_warp,
     xform_tensor_from_numpy,
+    xform_tensor_from_warp,
 )
 from isaaclab_ov.stage_usda import shared_stage_usda
 
@@ -2390,18 +2392,20 @@ class OVRTXRenderer(BaseRenderer):
         return None, None
 
     def _author_xforms_ovstage(self, query, transforms: wp.array) -> None:
-        """Author ``omni:xform`` for ``query`` by filling the mapped column.
+        """Author ``omni:xform`` for ``query`` using the mechanism the installed OVStage renders.
 
-        The column is mapped and filled rather than handed over as a tensor. A handover is
-        accepted and stored -- it reads back correctly, and so does the world matrix computed from
-        it -- but on a stage whose population includes the physics domain it never reaches the
-        render, leaving the prim drawn at its pre-write transform or not at all. Filling the mapped
-        column is picked up, and measures cheaper besides, so both populations take this path.
+        Neither mechanism works on both versions, and the one that does not fails silently: the
+        column accepts the write and reads back correctly while the prim stays put. OVStage 0.1
+        drops a handover to a prim in the physics domain, so the column is mapped and filled;
+        0.2 drops a mapped fill to a camera prim, and its handover is also far cheaper.
 
         Args:
             query: Prims to author, in the order ``transforms`` supplies them.
             transforms: One world transform per prim in ``query``.
         """
+        if XFORM_HANDOVER:
+            self._handover_xforms_ovstage(query, transforms)
+            return
         # Map groups expose the column as flat lanes rather than a (N, 4, 4) write shape, so the
         # matrices are copied through a scalar view of the same device memory.
         scalars = wp.array(
@@ -2420,12 +2424,40 @@ class OVRTXRenderer(BaseRenderer):
         try:
             offset = 0
             for group in mapping.groups():
+                # A map allocates exactly the queried rows in order, unlike a read, whose tensors
+                # carry the whole column behind index maps. The bulk copy below depends on that:
+                # a group that ever arrives mapped would silently land every row in the wrong prim.
+                if group.has_prim_index_map or group.has_data_index_map:
+                    raise RuntimeError(
+                        "Mapped omni:xform group carries an index map; the rows would be filled out of order."
+                    )
                 for index in range(group.tensor_count):
                     destination = wp.from_dlpack(group.array(index))
                     wp.copy(destination, scalars[offset : offset + destination.size])
                     offset += destination.size
         finally:
             mapping.unmap().wait()
+
+    def _handover_xforms_ovstage(self, query, transforms: wp.array) -> None:
+        """Author ``omni:xform`` by handing the column over as a stream-ordered tensor.
+
+        The handover is zero-copy, so its cost stays flat as the bound prim count grows where
+        a mapped fill scales with it. Only OVStage 0.2 and later render it; see
+        :func:`~isaaclab_ov.ovstage_compat.supports_xform_handover`.
+
+        Args:
+            query: Prims to author, in the order ``transforms`` supplies them.
+            transforms: One world transform per prim in ``query``.
+        """
+        self._stage.write_attribute(
+            query,
+            "omni:xform",
+            ordinal=self._current_ordinal,
+            tensors=xform_tensor_from_warp(transforms),
+            is_array=False,
+            semantic=ovstage.AttributeSemantic.MATRIX,
+            cuda_stream=self._warp_device.stream.cuda_stream,
+        ).wait()
 
     def _read_world_transforms_ovstage(self, prim_paths: list[str]) -> np.ndarray:
         """Read the world transform of each prim in ``prim_paths``.
@@ -2452,16 +2484,20 @@ class OVRTXRenderer(BaseRenderer):
                 if group is None:
                     break
                 try:
-                    local = 0
-                    for index in range(group.tensor_count):
-                        values = np.array(group.array(index), dtype=np.float64).reshape(-1, 4, 4)
-                        for value in values:
-                            # Groups carry their own row order, so each element is placed by the
-                            # index it resolves to in the path list rather than by arrival order.
-                            row = group.prim_index(local)
-                            transforms[row] = value
-                            seen[row] = True
-                            local += 1
+                    # A group's tensors carry the whole attribute column, not just the rows this
+                    # query asked for, and neither the prims nor the rows need arrive in order.
+                    # Both sides are therefore resolved through the group's own maps: element
+                    # ``local`` sits at row ``data_row_index`` and belongs to path-list entry
+                    # ``prim_index``. Walking the tensor instead runs off the end of the group.
+                    chunks = [
+                        np.array(group.array(index), dtype=np.float64).reshape(-1, 4, 4)
+                        for index in range(group.tensor_count)
+                    ]
+                    values = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+                    for local in range(group.prim_count):
+                        row = group.prim_index(local)
+                        transforms[row] = values[group.data_row_index(local)]
+                        seen[row] = True
                 finally:
                     self._stage.release_group(group)
             read.release().wait()
