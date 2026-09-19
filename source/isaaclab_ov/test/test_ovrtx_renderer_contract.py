@@ -719,6 +719,112 @@ def test_ovstage_pose_source_follows_the_simulating_backend(monkeypatch, newton_
     assert renderer._newton_owns_poses() is newton_is_manager
 
 
+def test_ovstage_world_transform_read_resolves_rows_through_the_group_maps():
+    """A group's tensor carries the whole column, not just the queried rows.
+
+    The queried prims are a subset in their own order, so a read that walks the tensor
+    instead of the group's maps mismatches every row and runs off the end of the group once
+    the column is larger than the query -- which is any scene past a couple of environments.
+    """
+    import numpy as np
+    import ovstage
+
+    wanted = ["/World/envs/env_0/Object", "/World/envs/env_1/Object"]
+    # Column for four prims; the two we asked for sit at rows 3 and 1, reversed.
+    column = np.zeros((4, 4, 4), dtype=np.float64)
+    column[3] = np.diag([1.0, 1.0, 1.0, 1.0])
+    column[3][3, :3] = [7.0, 0.0, 0.0]
+    column[1] = np.diag([1.0, 1.0, 1.0, 1.0])
+    column[1][3, :3] = [9.0, 0.0, 0.0]
+
+    class _Group:
+        prim_count = 2
+        data_count = 2
+        tensor_count = 1
+
+        def array(self, index: int):
+            return column.reshape(-1)
+
+        def prim_index(self, local: int) -> int:
+            if not 0 <= local < self.prim_count:
+                raise IndexError(f"prim index {local} out of range [0, {self.prim_count})")
+            return local
+
+        def data_row_index(self, local: int) -> int:
+            return (3, 1)[local]
+
+    class _Stage:
+        def __init__(self):
+            self._pending = [_Group()]
+
+        def query_from_path_list(self, path_list):
+            return object()
+
+        def read_attributes(self, query, tokens, ordinals):
+            return types.SimpleNamespace(release=lambda: types.SimpleNamespace(wait=lambda: None))
+
+        def fetch_read_next(self, read):
+            return self._pending.pop() if self._pending else None
+
+        def release_group(self, group) -> None: ...
+
+        def release_query(self, query):
+            return types.SimpleNamespace(wait=lambda: None)
+
+    renderer = OVRTXRenderer.__new__(OVRTXRenderer)
+    renderer._stage = _Stage()
+    renderer._stage_paths = types.SimpleNamespace(
+        create_path_list_from_strings=lambda paths: object(),
+        intern_token=lambda name: 1,
+        destroy_path_list=lambda path_list: None,
+    )
+    assert ovstage.OrdinalRange.latest(1) is not None
+
+    transforms = renderer._read_world_transforms_ovstage(wanted)
+
+    assert transforms[0][3][:3].tolist() == [7.0, 0.0, 0.0]
+    assert transforms[1][3][:3].tolist() == [9.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize("handover", [True, False])
+def test_ovstage_xform_mechanism_follows_the_installed_ovstage(monkeypatch, handover: bool):
+    """Both mechanisms fail silently on the version that does not render them.
+
+    OVStage 0.1 stores a handover to a physics-domain prim without drawing it, and 0.2 does the
+    same with a mapped fill to a camera, so nothing downstream reports a mechanism picked wrongly.
+    """
+    monkeypatch.setattr(ovrtx_renderer_module, "XFORM_HANDOVER", handover)
+    renderer = OVRTXRenderer.__new__(OVRTXRenderer)
+    transforms = wp.zeros(2, dtype=wp.mat44d, device="cpu")
+    calls: list[str] = []
+
+    class _Mapping:
+        def wait(self) -> None: ...
+
+        def groups(self) -> list:
+            return []
+
+        def unmap(self):
+            return types.SimpleNamespace(wait=lambda: None)
+
+    class _Stage:
+        def map_attribute(self, *args, **kwargs):
+            calls.append("mapped fill")
+            return _Mapping()
+
+        def write_attribute(self, *args, **kwargs):
+            calls.append("handover")
+            return types.SimpleNamespace(wait=lambda: None)
+
+    renderer._stage = _Stage()
+    renderer._current_ordinal = 7
+    renderer._warp_device = types.SimpleNamespace(stream=types.SimpleNamespace(cuda_stream=0))
+
+    renderer._author_xforms_ovstage(object(), transforms)
+
+    assert calls == ["handover" if handover else "mapped fill"]
+
+
 def test_ovstage_rereads_the_bound_scene_data_backend_every_frame():
     """Reading the backend is what refreshes it, so a cached read would freeze the scene."""
     renderer = OVRTXRenderer.__new__(OVRTXRenderer)

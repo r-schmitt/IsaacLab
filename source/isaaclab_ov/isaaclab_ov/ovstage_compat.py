@@ -12,8 +12,14 @@ wherever it is available. ``GPU_INCREMENTAL`` leaves objects out of place on OVS
 and is corrected in 0.2, so the model is chosen from the installed version rather than
 hard-coded.
 
-The installed version cannot change while the process runs, so the model is resolved once
-at import and published as :data:`HIERARCHY_COMPUTATION_MODEL`.
+The same version split decides how per-frame transforms are authored. A tensor handed over
+to ``write_attribute`` is dropped before the render on 0.1 when the prim is in the physics
+domain, so transforms are authored there by filling the mapped column instead. On 0.2 that
+reverses -- a mapped fill is dropped for camera prims -- and the handover is also far
+cheaper, staying flat as prim count grows where the fill scales with it.
+
+The installed version cannot change while the process runs, so both are resolved once
+at import and published as :data:`HIERARCHY_COMPUTATION_MODEL` and :data:`XFORM_HANDOVER`.
 
 The published name is resolved against :class:`ovstage.HierarchyComputationModel` by the
 caller, which keeps this module free of an ``ovstage`` import and therefore importable
@@ -34,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # First OVStage version whose GPU_INCREMENTAL hierarchy model places objects correctly.
 _GPU_HIERARCHY_VERSION = Version("0.2")
+
+# First OVStage version that renders transforms handed over to ``write_attribute``.
+_XFORM_HANDOVER_VERSION = Version("0.2")
 
 
 def detect_ovstage_version() -> Version | None:
@@ -85,8 +94,27 @@ def resolve_hierarchy_computation_model(version: Version | None) -> str:
     return "CPU_INCREMENTAL"
 
 
+def supports_xform_handover(version: Version | None) -> bool:
+    """Return whether ``version`` renders a transform handed over to ``write_attribute``.
+
+    On OVStage 0.1 the handover is accepted and stored for a prim in the physics domain --
+    it reads back correctly, and so does the world matrix computed from it -- but never
+    reaches the render, so transforms have to be authored by filling the mapped column.
+
+    Args:
+        version: OVStage version to classify, or ``None`` when OVStage is unavailable.
+
+    Returns:
+        Whether ``version`` is OVStage 0.2 or newer.
+    """
+    return version is not None and version >= _XFORM_HANDOVER_VERSION
+
+
 OVSTAGE_VERSION: Version | None = detect_ovstage_version()
 """Installed OVStage version, or ``None`` when it is unavailable or unparsable."""
 
 HIERARCHY_COMPUTATION_MODEL: str = resolve_hierarchy_computation_model(OVSTAGE_VERSION)
 """Name of the hierarchy computation model to request for the installed OVStage."""
+
+XFORM_HANDOVER: bool = supports_xform_handover(OVSTAGE_VERSION)
+"""Whether ``omni:xform`` is authored by tensor handover instead of filling the mapped column."""
