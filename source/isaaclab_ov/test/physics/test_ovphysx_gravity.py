@@ -79,3 +79,42 @@ def test_gravity_event_changes_rigid_body_motion():
 
         assert zero_gravity_height == pytest.approx(initial_height, abs=1.0e-4)
         assert earth_gravity_height - zero_gravity_height < -0.5
+
+
+def test_reapplying_the_running_gravity_drains_no_ordinal():
+    """Gravity the scene already runs with must not be re-authored.
+
+    A ``mode="reset"`` randomization term resampling a constant calls this on every reset, and
+    each control ordinal drained into OVPhysX makes it re-ingest the shared stage.
+    """
+    from isaaclab_ov.physics import OvPhysxManager
+
+    sim_cfg = SimulationCfg(physics=OvPhysxCfg(), device="cpu", dt=1.0 / 60.0)
+    with build_simulation_context(device="cpu", sim_cfg=sim_cfg) as sim:
+        RigidObject(
+            RigidObjectCfg(
+                prim_path="/World/Cube",
+                init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 10.0)),
+                spawn=sim_utils.CuboidCfg(
+                    size=(0.5, 0.5, 0.5),
+                    rigid_props=sim_utils.RigidBodyBaseCfg(),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                    collision_props=sim_utils.CollisionBaseCfg(),
+                ),
+            )
+        )
+        sim.reset()
+        lanes = OvPhysxManager._ovstage.ordinals  # noqa: SLF001 - the drain is what is under test
+
+        # Re-applying the configured gravity, which is what a reset term resampling a constant
+        # does, must cost nothing. -9.81 also does not survive a float32 round-trip intact, so a
+        # running value has to be recognized in the precision it was written at.
+        assert lanes.latest_control is None
+        OvPhysxManager.set_gravity(tuple(sim.cfg.gravity))
+        assert lanes.latest_control is None
+
+        OvPhysxManager.set_gravity((0.0, 0.0, -2.0))
+        after_change = lanes.latest_control
+        assert after_change is not None
+        OvPhysxManager.set_gravity((0.0, 0.0, -2.0))
+        assert lanes.latest_control == after_change

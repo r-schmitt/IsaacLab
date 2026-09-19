@@ -681,7 +681,7 @@ def test_ovrtx_close_releases_ovstage_renderer_state():
     assert renderer._render_product_paths == []
     assert renderer._output_id_color_buffers == {}
     assert renderer._initialized_scene is False
-    assert renderer._current_ordinal == 0
+    assert renderer._current_ordinal is None
 
 
 def test_ovrtx_close_is_idempotent():
@@ -823,6 +823,44 @@ def test_ovstage_xform_mechanism_follows_the_installed_ovstage(monkeypatch, hand
     renderer._author_xforms_ovstage(object(), transforms)
 
     assert calls == ["handover" if handover else "mapped fill"]
+
+
+def test_ovstage_render_commits_above_an_ordinal_the_physics_consumer_sealed_in_between():
+    """Holding an output ordinal across another consumer's seal fails every write at it.
+
+    Ordinals are shared with OVPhysX, which seals a control ordinal whenever a ``mode="reset"``
+    gravity event runs. An ordinal reserved before that seal is at or below the write floor by
+    the time the next frame writes at it, and OVStage rejects it with ``WRITE_FLOOR_VIOLATION``.
+    """
+    from isaaclab_ov.ovstage_ordinals import OvStageOrdinalLanes
+
+    lanes = OvStageOrdinalLanes()
+    sealed: list[int] = []
+
+    class _SharedStage:
+        ordinals = lanes
+
+        def seal(self, ordinal: int) -> None:
+            sealed.append(ordinal)
+
+    class _Backend:
+        def step(self, *, render_products, delta_time, ordinal):
+            return {}
+
+    renderer = OVRTXRenderer.__new__(OVRTXRenderer)
+    renderer._initialized_scene = True
+    renderer._renderer = _Backend()
+    renderer._render_product_paths = ["/Render/RenderProduct_camera"]
+    renderer._visual_material_writer_ref = None
+    renderer._shared_stage = _SharedStage()
+    renderer._current_ordinal = None
+    render_data = types.SimpleNamespace(ppisp_pipeline=None)
+
+    renderer._render_ovstage(render_data)
+    control_ordinal = lanes.next_control()
+    renderer._render_ovstage(render_data)
+
+    assert sealed[-1] > control_ordinal
 
 
 def test_ovstage_rereads_the_bound_scene_data_backend_every_frame():

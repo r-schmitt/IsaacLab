@@ -306,11 +306,17 @@ class EventCfg:
     # Gravity scheduling is a deliberate curriculum trick — starting with no
     # gravity (easy) and gradually introducing full gravity (hard) makes learning
     # smoother and removes the need for a separate "Lift" reward.
+    #
+    # PINNED TO FULL GRAVITY FOR SHARED-OVSTAGE BENCHMARKING. A live gravity change makes OVPhysX
+    # re-ingest the stage it shares with the renderer, which deletes the physics content of every
+    # environment the renderer cloned and invalidates all tensor views. Pinning both bounds to the
+    # configured gravity keeps this term a no-op. Restore the zero-to-full schedule here and in
+    # ``gravity_adr`` once OVPhysX reconciles render-side edits instead of destroying them.
     variable_gravity = EventTerm(
         func=mdp.randomize_physics_scene_gravity,
         mode="reset",
         params={
-            "gravity_distribution_params": ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+            "gravity_distribution_params": ([0.0, 0.0, -9.81], [0.0, 0.0, -9.81]),
             "operation": "abs",
         },
     )

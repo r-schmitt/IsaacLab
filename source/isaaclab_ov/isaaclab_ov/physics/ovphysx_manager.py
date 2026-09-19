@@ -774,7 +774,10 @@ class OvPhysxManager(PhysicsManager):
         The OvPhysX runtime accepts live scene changes only as sealed OvStage
         control updates. This method authors the scene's gravity direction and
         magnitude at the next control ordinal, seals it, and applies that
-        single ordinal to the running simulation.
+        single ordinal to the running simulation. Gravity already applied to the
+        scene is left alone: a ``mode="reset"`` randomization term resampling a
+        constant would otherwise drain an ordinal on every reset, which on a
+        stage shared with a render consumer is far from free.
 
         Args:
             gravity: World-frame gravity vector [m/s^2].
@@ -789,6 +792,11 @@ class OvPhysxManager(PhysicsManager):
         gravity_array = np.asarray(gravity, dtype=np.float32)
         if gravity_array.shape != (3,) or not np.all(np.isfinite(gravity_array)):
             raise ValueError("Gravity must contain three finite values.")
+
+        # Compared in the precision the scene runs at: the cached value carries the cfg's
+        # float64 literals, which never equal their float32 round-trip for values like -9.81.
+        if cls._gravity is not None and np.array_equal(np.asarray(cls._gravity, dtype=np.float32), gravity_array):
+            return
 
         magnitude = float(np.linalg.norm(gravity_array))
         if math.isclose(magnitude, 0.0):
