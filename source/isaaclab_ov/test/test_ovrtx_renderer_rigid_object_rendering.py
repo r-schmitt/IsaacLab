@@ -43,6 +43,29 @@ else:
     OvPhysxCfg = None
 
 
+def _record_ovstage_acquisitions(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the shared stage's consumer count after every acquisition during a run.
+
+    Args:
+        monkeypatch: Fixture used to wrap the owner's acquire for the duration of the test.
+
+    Returns:
+        Consumer count after each acquisition, in order, filled as the run proceeds.
+    """
+    from isaaclab_ov.ovstage_owner import OvStageOwner
+
+    counts: list[int] = []
+    acquire = OvStageOwner.acquire
+
+    def recording_acquire(self, stage_usda: str):
+        shared = acquire(self, stage_usda)
+        counts.append(self.consumer_count)
+        return shared
+
+    monkeypatch.setattr(OvStageOwner, "acquire", recording_acquire)
+    return counts
+
+
 @pytest.mark.parametrize(
     "use_ovstage",
     [
@@ -60,6 +83,11 @@ def test_kinematic_rigid_object_scale_and_pose_are_rendered(monkeypatch: pytest.
     assert OVRTXRendererCfg is not None
     assert OvPhysxCfg is not None
     monkeypatch.setenv("ISAAC_LAB_OVRTX_USE_OVSTAGE", str(int(use_ovstage)))
+
+    # On the OVStage path physics and the renderer draw from one stage, so the consumer count after
+    # each acquisition tells whether the renderer joined the stage physics holds or opened a second.
+    consumer_counts = _record_ovstage_acquisitions(monkeypatch) if use_ovstage else None
+
     sim_cfg = SimulationCfg(device="cuda:0", gravity=(0.0, 0.0, 0.0), physics=OvPhysxCfg())
     run_rigid_object_scale_and_pose_rendering_contract(
         RigidObjectRenderingBackend(
@@ -69,3 +97,9 @@ def test_kinematic_rigid_object_scale_and_pose_are_rendered(monkeypatch: pytest.
             cleanup=NewtonManager.clear,
         )
     )
+
+    if consumer_counts is not None:
+        assert consumer_counts == [1, 2], (
+            "Expected physics and the renderer to share one OVStage, acquired in turn, got consumer counts"
+            f" {consumer_counts}."
+        )

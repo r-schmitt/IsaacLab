@@ -72,6 +72,7 @@ from isaaclab.renderers import BaseRenderer, RenderBufferKind, RenderBufferSpec
 from isaaclab.sim import SimulationContext
 from isaaclab.utils.warp.warp_math import convert_camera_frame_orientation_convention_wp
 
+from isaaclab_ov.ovstage_owner import ovstage_owner
 from isaaclab_ov.renderers.ovrtx_annotator_utils import (
     build_instance_id_to_labels_and_semantics,
     build_semantic_id_to_labels,
@@ -1876,16 +1877,18 @@ class OVRTXRenderer(BaseRenderer):
 
         logger.info("Loading USD into OvRTX via ovstage...")
         self._ovstage_exit_stack = contextlib.ExitStack()
-        self._shared_stage = self._ovstage_exit_stack.enter_context(SharedOvStage("isaaclab.ovrtx"))
+        # The stage physics is already attached to, populated from the same serialization, rather
+        # than a second stage holding a second resident copy of the scene. Released rather than
+        # destroyed: it outlives this renderer whenever physics still holds it.
+        owner = ovstage_owner()
+        self._shared_stage = owner.acquire(combined_usd_string)
+        self._ovstage_exit_stack.callback(owner.release)
         self._stage = self._shared_stage.stage
         self._stage_paths = self._shared_stage.paths
-        # Every init-time write shares the population ordinal, so the scene the renderer first
-        # sees is complete: population, the clone, and the bindings below all land together.
-        self._current_ordinal = self._shared_stage.population_ordinal
-        self._shared_stage.populate_from_usda(
-            combined_usd_string,
-            domains=ovstage.PopulationDomain.RENDERING,
-        )
+        # The population ordinal is sealed before it is handed over, so the setup below goes to an
+        # ordinal of its own. It has to be an output ordinal: these are render-side edits, and
+        # physics must never drain them back in as though they were authored physics input.
+        self._current_ordinal = self._shared_stage.ordinals.next_output()
 
         if num_envs > 1:
             self._clone_sources_ovstage()
@@ -1923,13 +1926,7 @@ class OVRTXRenderer(BaseRenderer):
 
         # Resetting the xform stack makes omni:xform the absolute world transform, preventing
         # ancestor transforms (env root, asset root) from compounding on top of the camera pose.
-        self._stage.write_attribute(
-            self._camera_xform_query,
-            "omni:resetXformStack",
-            ordinal=self._current_ordinal,
-            tensors=np.full(num_envs, True, dtype=np.bool_),
-            is_array=False,
-        ).wait()
+        self._pin_reset_xform_stack_ovstage(self._camera_xform_query)
 
         self._setup_xform_bindings_ovstage()
         self._setup_deformable_bindings_ovstage(num_envs)
@@ -1940,10 +1937,43 @@ class OVRTXRenderer(BaseRenderer):
         # immediately sees the fully-configured scene on its first step.
         self._shared_stage.seal(self._current_ordinal)
         self._renderer.attach_ovstage(self._stage)
+        # The clone, the render product's camera relationship and the scene partitions above are
+        # structural edits committed after the population this stage was attached at. ovstage's
+        # shared-Stage sequencing has the renderer take those up explicitly; only a one-shot
+        # initial load is rebuilt implicitly by the first step.
+        self._renderer.update_from_stage(self._current_ordinal)
         logger.info("OVRTX loaded USD from string successfully via ovstage")
         # Per-frame poses are simulation output: written for the renderer to draw, never drained
         # back into a physics runtime sharing this stage.
         self._current_ordinal = self._shared_stage.ordinals.next_output()
+
+    def _pin_reset_xform_stack_ovstage(self, query) -> None:
+        """Set ``omni:resetXformStack`` on ``query``'s prims, whatever type the column carries.
+
+        Makes ``omni:xform`` the absolute world transform, so ancestor transforms (env root, asset
+        root) do not compound on top of what this renderer writes. Used for the prims it authors in
+        world space: the cameras, and the geometry whose points a kernel emits in world space.
+        Prims the physics backend drives are authored relative to their parent instead, because the
+        pin does not hold for them on a stage shared with physics; see
+        :meth:`_object_parent_inverses_ovstage`.
+
+        The column's element type depends on who declared it: a population including the physics
+        domain declares it ``uint8`` for simulated prims, while prims only this renderer touches
+        get ``bool``. ``write_attribute`` rejects a tensor whose type differs from the column's, so
+        the column is mapped and filled instead -- ``map_attribute`` without an explicit ``dtype``
+        adopts the declared type rather than imposing one.
+
+        Args:
+            query: Stage query selecting the prims to pin.
+        """
+        mapping = self._stage.map_attribute(query, "omni:resetXformStack", ordinal=self._current_ordinal)
+        mapping.wait()
+        try:
+            for group in mapping.groups():
+                for index in range(group.tensor_count):
+                    group.array(index)[:] = 1
+        finally:
+            mapping.unmap().wait()
 
     def _clone_sources_ovstage(self):
         """Clone sources in OVRTX using the scene :class:`~isaaclab.cloner.ClonePlan` (ovstage path)."""
@@ -2230,13 +2260,7 @@ class OVRTXRenderer(BaseRenderer):
 
         # particle_q is already in world space, so resetting the xform stack and pinning an identity
         # omni:xform prevents the env-root and asset-root ancestor transforms from being applied on top.
-        self._stage.write_attribute(
-            self._deformable_points_query,
-            "omni:resetXformStack",
-            ordinal=self._current_ordinal,
-            tensors=np.full(prim_count, True, dtype=np.bool_),
-            is_array=False,
-        ).wait()
+        self._pin_reset_xform_stack_ovstage(self._deformable_points_query)
 
         identity_xforms = np.tile(np.eye(4, dtype=np.float64), (prim_count, 1, 1))
         self._stage.write_attribute(
@@ -2270,13 +2294,7 @@ class OVRTXRenderer(BaseRenderer):
 
         # The kernel emits world space, so reset the xform stack and pin an identity omni:xform to
         # stop the env-root and asset-root ancestor transforms being applied on top.
-        self._stage.write_attribute(
-            self._cable_points_query,
-            "omni:resetXformStack",
-            ordinal=self._current_ordinal,
-            tensors=np.full(prim_count, True, dtype=np.bool_),
-            is_array=False,
-        ).wait()
+        self._pin_reset_xform_stack_ovstage(self._cable_points_query)
 
         identity_xforms = np.tile(np.eye(4, dtype=np.float64), (prim_count, 1, 1))
         self._stage.write_attribute(
@@ -2331,13 +2349,7 @@ class OVRTXRenderer(BaseRenderer):
         #
         # particle_q is already in world space, so resetting the xform stack and pinning an identity
         # omni:xform prevents the env-root and asset-root ancestor transforms from being applied on top.
-        self._stage.write_attribute(
-            self._particle_points_query,
-            "omni:resetXformStack",
-            ordinal=self._current_ordinal,
-            tensors=np.full(prim_count, True, dtype=np.bool_),
-            is_array=False,
-        ).wait()
+        self._pin_reset_xform_stack_ovstage(self._particle_points_query)
 
         identity_xforms = np.tile(np.eye(4, dtype=np.float64), (prim_count, 1, 1))
         self._stage.write_attribute(
