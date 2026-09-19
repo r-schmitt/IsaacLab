@@ -86,6 +86,7 @@ from isaaclab_ov.renderers.ovrtx_renderer_kernels import (
     create_camera_transforms_kernel,
     extract_all_tiles_kernel,
     generate_random_colors_from_ids_kernel,
+    make_transforms_parent_relative_kernel,
     sync_newton_transforms_kernel,
 )
 from isaaclab_ov.renderers.ovrtx_shader_cache import redirect_shader_cache
@@ -1833,6 +1834,8 @@ class OVRTXRenderer(BaseRenderer):
         # merged transform array that the bound prims correspond to.
         self._object_scene_data_backend: SceneDataBackend | None = None
         self._object_scene_data_rows: wp.array | None = None
+        self._object_parent_paths: list[str] = []
+        self._object_parent_inverses: wp.array | None = None
         self._deformable_points_query = None
         self._deformable_paths_list = None
         self._particle_points_query = None
@@ -2149,13 +2152,9 @@ class OVRTXRenderer(BaseRenderer):
         if self._object_xform_query is None:
             raise RuntimeError("Failed to create OVRTX object bindings")
 
-        self._stage.write_attribute(
-            self._object_xform_query,
-            "omni:resetXformStack",
-            ordinal=self._current_ordinal,
-            tensors=np.full(len(object_paths), True, dtype=np.bool_),
-            is_array=False,
-        ).wait()
+        # Poses are authored relative to each prim's parent rather than as absolute world
+        # transforms, so the xform stack is left alone; see :meth:`_object_parent_inverses_ovstage`.
+        self._object_parent_paths = [path.rsplit("/", 1)[0] for path in object_paths]
 
         row_array = wp.array(rows, dtype=wp.int32, device=self._device)
         if scene_data_backend is None:
@@ -2416,6 +2415,78 @@ class OVRTXRenderer(BaseRenderer):
         finally:
             mapping.unmap().wait()
 
+    def _read_world_transforms_ovstage(self, prim_paths: list[str]) -> np.ndarray:
+        """Read the world transform of each prim in ``prim_paths``.
+
+        Args:
+            prim_paths: Prims to read, without duplicates.
+
+        Returns:
+            One world transform [m] per prim, shape ``[len(prim_paths), 4, 4]``, in the order
+            ``prim_paths`` supplies them.
+
+        Raises:
+            RuntimeError: If the stage did not report a transform for every prim.
+        """
+        transforms = np.zeros((len(prim_paths), 4, 4), dtype=np.float64)
+        seen = np.zeros(len(prim_paths), dtype=bool)
+        path_list = self._stage_paths.create_path_list_from_strings(prim_paths)
+        query = self._stage.query_from_path_list(path_list)
+        try:
+            token = self._stage_paths.intern_token("omni:fabric:worldMatrix")
+            read = self._stage.read_attributes(query, [token], ovstage.OrdinalRange.latest(1))
+            while True:
+                group = self._stage.fetch_read_next(read)
+                if group is None:
+                    break
+                try:
+                    local = 0
+                    for index in range(group.tensor_count):
+                        values = np.array(group.array(index), dtype=np.float64).reshape(-1, 4, 4)
+                        for value in values:
+                            # Groups carry their own row order, so each element is placed by the
+                            # index it resolves to in the path list rather than by arrival order.
+                            row = group.prim_index(local)
+                            transforms[row] = value
+                            seen[row] = True
+                            local += 1
+                finally:
+                    self._stage.release_group(group)
+            read.release().wait()
+        finally:
+            self._stage.release_query(query).wait()
+            self._stage_paths.destroy_path_list(path_list)
+
+        if not seen.all():
+            missing = [path for path, found in zip(prim_paths, seen, strict=True) if not found]
+            raise RuntimeError(f"No world transform reported for {len(missing)} prim(s), first {missing[0]}.")
+        return transforms
+
+    def _object_parent_inverses_ovstage(self) -> wp.array:
+        """Return the inverse world transform of every bound object prim's parent.
+
+        ``omni:xform`` replaces a prim's own transform but is still composed onto its ancestors, so
+        a pose the physics backend publishes in world space is authored relative to the parent.
+        Resetting the xform stack would be the alternative, but on a stage shared with physics that
+        is not honored for simulated prims, which leaves them drawn at twice their environment
+        offset.
+
+        Parents of bound prims -- environment roots and asset roots -- do not move, so this is
+        resolved once, on the first frame: the environment roots are written during setup and only
+        become readable once that ordinal is sealed.
+
+        Returns:
+            One inverse parent world transform per bound prim, in binding order.
+        """
+        if self._object_parent_inverses is None:
+            unique_paths = list(dict.fromkeys(self._object_parent_paths))
+            world = self._read_world_transforms_ovstage(unique_paths)
+            inverses = dict(zip(unique_paths, np.linalg.inv(world), strict=True))
+            self._object_parent_inverses = wp.array(
+                [inverses[path] for path in self._object_parent_paths], dtype=wp.mat44d, device=self._device
+            )
+        return self._object_parent_inverses
+
     def _update_transforms_ovstage(self) -> None:
         if self._object_xform_query is None or self._object_scales is None:
             return
@@ -2432,6 +2503,12 @@ class OVRTXRenderer(BaseRenderer):
             kernel=sync_newton_transforms_kernel,
             dim=num_objects,
             inputs=[object_transforms, body_rows, body_q, self._object_scales],
+            device=self._device,
+        )
+        wp.launch(
+            kernel=make_transforms_parent_relative_kernel,
+            dim=num_objects,
+            inputs=[object_transforms, self._object_parent_inverses_ovstage()],
             device=self._device,
         )
         self._author_xforms_ovstage(self._object_xform_query, object_transforms)
@@ -2640,6 +2717,8 @@ class OVRTXRenderer(BaseRenderer):
         # physics backend alive.
         self._object_scene_data_backend = None
         self._object_scene_data_rows = None
+        self._object_parent_paths = []
+        self._object_parent_inverses = None
         self._object_scales = None
         self._object_scales_by_path = {}
         self._deformable_particle_offsets = []

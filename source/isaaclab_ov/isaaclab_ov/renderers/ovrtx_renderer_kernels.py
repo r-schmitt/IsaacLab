@@ -202,6 +202,25 @@ def sync_newton_transforms_kernel(
     )
 
 
+@wp.kernel
+def make_transforms_parent_relative_kernel(
+    transforms: wp.array(dtype=wp.mat44d),  # type: ignore
+    parent_inverse_transforms: wp.array(dtype=wp.mat44d),  # type: ignore
+):
+    """Rewrite world transforms in place as transforms relative to each prim's parent.
+
+    ``omni:xform`` is composed onto the ancestor chain, so a pose the physics backend publishes in
+    world space has to be expressed relative to the parent before it is authored:
+    ``local = world * parent^-1`` in the row-vector convention these matrices carry.
+
+    Args:
+        transforms: World transforms [m] in, parent-relative transforms out, one per bound prim.
+        parent_inverse_transforms: Inverse world transform of each prim's parent, same order.
+    """
+    i = wp.tid()
+    transforms[i] = transforms[i] * parent_inverse_transforms[i]
+
+
 @wp.func
 def _cable_capsule_endpoint_world(
     shape_id: int,
