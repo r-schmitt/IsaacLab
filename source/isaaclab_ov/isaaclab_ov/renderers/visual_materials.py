@@ -103,7 +103,7 @@ class OVRTXVisualMaterialWriter:
                     operation = renderer._stage.write_attribute(
                         address,
                         attribute_name,
-                        ordinal=renderer._current_ordinal,
+                        ordinal=renderer._output_ordinal(),
                         tensors=self._buffers[channel][rows],
                         is_array=False,
                         cuda_event=self._event.cuda_event,

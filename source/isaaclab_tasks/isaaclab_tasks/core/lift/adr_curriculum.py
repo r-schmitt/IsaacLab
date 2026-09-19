@@ -128,13 +128,16 @@ class CurriculumCfg:
         },
     )
 
+    # PINNED TO FULL GRAVITY FOR SHARED-OVSTAGE BENCHMARKING: with the initial value matching the
+    # final one, no difficulty change re-authors gravity. See ``variable_gravity`` in
+    # ``lift_env_cfg`` for why a live gravity change is currently destructive on a shared OVStage.
     gravity_adr = CurrTerm(
         func=mdp.modify_term_cfg,
         params={
             "address": "events.variable_gravity.params.gravity_distribution_params",
             "modify_fn": mdp.initial_final_interpolate_fn,
             "modify_params": {
-                "initial_value": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                "initial_value": ((0.0, 0.0, -9.81), (0.0, 0.0, -9.81)),
                 "final_value": ((0.0, 0.0, -9.81), (0.0, 0.0, -9.81)),
                 "difficulty_term_str": "adr",
             },

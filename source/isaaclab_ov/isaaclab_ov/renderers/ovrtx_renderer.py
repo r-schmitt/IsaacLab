@@ -1827,7 +1827,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage = None
         self._stage_paths = None
         self._ovstage_exit_stack: contextlib.ExitStack | None = None
-        self._current_ordinal: int = 0
+        self._current_ordinal: int | None = None
         self._camera_xform_query = None
         self._camera_paths_list = None
         self._object_xform_query = None
@@ -1847,6 +1847,22 @@ class OVRTXRenderer(BaseRenderer):
         self._cable_paths_list = None
         # DLTensor descriptors aliasing ``_cable_point_slices``; rebuilt only when cables rebind.
         self._cable_point_tensors: list = []
+
+    def _output_ordinal(self) -> int:
+        """Return the ordinal this batch of writes lands at, reserving one if none is open.
+
+        Reserved on first use after a seal rather than held from the previous frame. Ordinals are
+        shared with OVPhysX, so a control ordinal sealed in between - a ``mode="reset"`` gravity
+        event, for instance - raises the write floor above any ordinal held across it, and every
+        write at the held ordinal fails with ``WRITE_FLOOR_VIOLATION``.
+
+        Returns:
+            The open output ordinal. Render-side edits are simulation output, never drained back
+            into a physics runtime sharing this stage.
+        """
+        if self._current_ordinal is None:
+            self._current_ordinal = self._shared_stage.ordinals.next_output()
+        return self._current_ordinal
 
     def _initialize_from_spec_ovstage(self, spec: CameraRenderSpec) -> None:
         """Initialize the OVRTX renderer with internal environment cloning (ovstage path).
@@ -1887,10 +1903,6 @@ class OVRTXRenderer(BaseRenderer):
         self._ovstage_exit_stack.callback(owner.release)
         self._stage = self._shared_stage.stage
         self._stage_paths = self._shared_stage.paths
-        # The population ordinal is sealed before it is handed over, so the setup below goes to an
-        # ordinal of its own. It has to be an output ordinal: these are render-side edits, and
-        # physics must never drain them back in as though they were authored physics input.
-        self._current_ordinal = self._shared_stage.ordinals.next_output()
 
         if num_envs > 1:
             self._clone_sources_ovstage()
@@ -1912,7 +1924,7 @@ class OVRTXRenderer(BaseRenderer):
             self._stage.write_attribute(
                 render_product_query,
                 camera_attribute,
-                ordinal=self._current_ordinal,
+                ordinal=self._output_ordinal(),
                 tensors=camera_target_ids,
                 is_array=True,
                 semantic=ovstage.AttributeSemantic.RELATIONSHIP_PATH_ID,
@@ -1937,17 +1949,16 @@ class OVRTXRenderer(BaseRenderer):
 
         # Commit all init-time writes then attach. attach_ovstage happens last so the renderer
         # immediately sees the fully-configured scene on its first step.
-        self._shared_stage.seal(self._current_ordinal)
+        setup_ordinal = self._output_ordinal()
+        self._shared_stage.seal(setup_ordinal)
         self._renderer.attach_ovstage(self._stage)
         # The clone, the render product's camera relationship and the scene partitions above are
         # structural edits committed after the population this stage was attached at. ovstage's
         # shared-Stage sequencing has the renderer take those up explicitly; only a one-shot
         # initial load is rebuilt implicitly by the first step.
-        self._renderer.update_from_stage(self._current_ordinal)
+        self._renderer.update_from_stage(setup_ordinal)
         logger.info("OVRTX loaded USD from string successfully via ovstage")
-        # Per-frame poses are simulation output: written for the renderer to draw, never drained
-        # back into a physics runtime sharing this stage.
-        self._current_ordinal = self._shared_stage.ordinals.next_output()
+        self._current_ordinal = None
 
     def _pin_reset_xform_stack_ovstage(self, query) -> None:
         """Set ``omni:resetXformStack`` on ``query``'s prims, whatever type the column carries.
@@ -1968,7 +1979,7 @@ class OVRTXRenderer(BaseRenderer):
         Args:
             query: Stage query selecting the prims to pin.
         """
-        mapping = self._stage.map_attribute(query, "omni:resetXformStack", ordinal=self._current_ordinal)
+        mapping = self._stage.map_attribute(query, "omni:resetXformStack", ordinal=self._output_ordinal())
         mapping.wait()
         try:
             for group in mapping.groups():
@@ -2000,7 +2011,7 @@ class OVRTXRenderer(BaseRenderer):
             if target_paths:
                 logger.debug("Cloning row %d: %s -> %d target(s)", row_idx, source, len(target_paths))
                 try:
-                    self._stage.clone(source, target_paths, ordinal=self._current_ordinal)
+                    self._stage.clone(source, target_paths, ordinal=self._output_ordinal())
                     num_cloned_sources += 1
                 except Exception as e:
                     error_msg = f"Failed to clone row {row_idx} from {source}: {e}"
@@ -2015,7 +2026,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             env_query,
             "omni:xform",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=xform_tensor_from_numpy(env_root_xforms),
             is_array=False,
             semantic=ovstage.AttributeSemantic.MATRIX,
@@ -2038,7 +2049,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             env_query,
             "primvars:omni:scenePartition",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=token_ids,
             is_array=False,
             semantic=ovstage.AttributeSemantic.TOKEN_ID,
@@ -2052,7 +2063,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             cam_query,
             "omni:scenePartition",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=token_ids,
             is_array=False,
             semantic=ovstage.AttributeSemantic.TOKEN_ID,
@@ -2268,7 +2279,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             self._deformable_points_query,
             "omni:xform",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=xform_tensor_from_numpy(identity_xforms),
             is_array=False,
             semantic=ovstage.AttributeSemantic.MATRIX,
@@ -2302,7 +2313,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             self._cable_points_query,
             "omni:xform",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=xform_tensor_from_numpy(identity_xforms),
             is_array=False,
             semantic=ovstage.AttributeSemantic.MATRIX,
@@ -2357,7 +2368,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             self._particle_points_query,
             "omni:xform",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=xform_tensor_from_numpy(identity_xforms),
             is_array=False,
             semantic=ovstage.AttributeSemantic.MATRIX,
@@ -2417,7 +2428,7 @@ class OVRTXRenderer(BaseRenderer):
         mapping = self._stage.map_attribute(
             query,
             "omni:xform",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             semantic=ovstage.AttributeSemantic.MATRIX,
         )
         mapping.wait()
@@ -2452,7 +2463,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             query,
             "omni:xform",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=xform_tensor_from_warp(transforms),
             is_array=False,
             semantic=ovstage.AttributeSemantic.MATRIX,
@@ -2626,7 +2637,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             query,
             "points",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=particle_slices,
             is_array=True,
             semantic=ovstage.AttributeSemantic.POINT,
@@ -2645,7 +2656,7 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.write_attribute(
             self._cable_points_query,
             "points",
-            ordinal=self._current_ordinal,
+            ordinal=self._output_ordinal(),
             tensors=self._cable_point_tensors,
             is_array=True,
             semantic=ovstage.AttributeSemantic.POINT,
@@ -2689,7 +2700,8 @@ class OVRTXRenderer(BaseRenderer):
         try:
             if material_writer is not None:
                 material_writer.publish()
-            self._shared_stage.seal(self._current_ordinal)
+            frame_ordinal = self._output_ordinal()
+            self._shared_stage.seal(frame_ordinal)
         finally:
             if material_writer is not None:
                 drain_errors = contextlib.nullcontext() if sys.exc_info()[0] is None else contextlib.suppress(Exception)
@@ -2698,9 +2710,9 @@ class OVRTXRenderer(BaseRenderer):
         products = self._renderer.step(
             render_products=set(self._render_product_paths),
             delta_time=1.0 / 60.0,
-            ordinal=self._current_ordinal,
+            ordinal=frame_ordinal,
         )
-        self._current_ordinal = self._shared_stage.ordinals.next_output()
+        self._current_ordinal = None
         product_path = self._render_product_paths[0]
         if product_path in products and len(products[product_path].frames) > 0:
             self._process_render_frame(
@@ -2805,4 +2817,4 @@ class OVRTXRenderer(BaseRenderer):
         self._render_product_paths.clear()
         self._output_id_color_buffers.clear()
         self._initialized_scene = False
-        self._current_ordinal = 0
+        self._current_ordinal = None
