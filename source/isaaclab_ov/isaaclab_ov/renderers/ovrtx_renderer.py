@@ -1595,10 +1595,14 @@ class OVRTXRenderer(BaseRenderer):
             self._init_fields_legacy()
 
     def _initialize_from_spec(self, spec: CameraRenderSpec) -> None:
-        if self._use_ovstage:
-            self._initialize_from_spec_ovstage(spec)
-        else:
-            self._initialize_from_spec_legacy(spec)
+        # TEMPORARY benchmarking instrumentation; remove before review.
+        from isaaclab.utils.timer import Timer  # noqa: PLC0415
+
+        with Timer("[TIMING] ovrtx.initialize_from_spec (total)"):
+            if self._use_ovstage:
+                self._initialize_from_spec_ovstage(spec)
+            else:
+                self._initialize_from_spec_legacy(spec)
 
     def _setup_xform_bindings(self) -> None:
         if self._use_ovstage:
@@ -1822,21 +1826,27 @@ class OVRTXRenderer(BaseRenderer):
             _write_file(Path(self.cfg.temp_usd_dir), "ovrtx_renderer_stage.usda", combined_usd_string)
 
         logger.info("Loading USD into OvRTX via ovstage...")
+        # TEMPORARY benchmarking instrumentation; remove before review.
+        from isaaclab.utils.timer import Timer  # noqa: PLC0415
+
         self._ovstage_exit_stack = contextlib.ExitStack()
         self._stage = self._ovstage_exit_stack.enter_context(create_ovstage("isaaclab.ovrtx"))
         self._stage_paths = self._ovstage_exit_stack.enter_context(ovstage.PathDictionary(self._stage))
         # Ordinal 0 is the empty/unwritten state in ovstage; the first write must use >= 1.
         self._current_ordinal += 1
-        ovstage.population.open_usd_from_string(
-            self._stage,
-            combined_usd_string,
-            ordinal=self._current_ordinal,
-            domains=ovstage.PopulationDomain.RENDERING,
-        )
+        with Timer("[TIMING] ovrtx.populate_stage"):
+            ovstage.population.open_usd_from_string(
+                self._stage,
+                combined_usd_string,
+                ordinal=self._current_ordinal,
+                domains=ovstage.PopulationDomain.RENDERING,
+            )
 
         if num_envs > 1:
-            self._clone_sources_ovstage()
-            self._update_scene_partitions_after_clone_ovstage(num_envs)
+            with Timer("[TIMING] ovrtx.clone_sources"):
+                self._clone_sources_ovstage()
+            with Timer("[TIMING] ovrtx.scene_partitions"):
+                self._update_scene_partitions_after_clone_ovstage(num_envs)
 
         self._initialized_scene = True
 
@@ -1846,19 +1856,20 @@ class OVRTXRenderer(BaseRenderer):
         # cameras, so the RenderProduct must be pointed at the freshly-interned camera path ids to discover every
         # camera for tiled rendering.
         render_product_paths = self._stage_paths.create_path_list_from_strings([render_product_path])
-        with self._stage.query_from_path_list(render_product_paths) as render_product_query:
-            camera_attribute = self._stage_paths.intern_token("camera")
-            camera_target_ids = np.array(
-                [self._stage_paths.intern_path(path) for path in camera_paths], dtype=np.uint64
-            )
-            self._stage.write_attribute(
-                render_product_query,
-                camera_attribute,
-                ordinal=self._current_ordinal,
-                tensors=camera_target_ids,
-                is_array=True,
-                semantic=ovstage.AttributeSemantic.RELATIONSHIP_PATH_ID,
-            ).wait()
+        with Timer("[TIMING] ovrtx.render_product_cameras"):
+            with self._stage.query_from_path_list(render_product_paths) as render_product_query:
+                camera_attribute = self._stage_paths.intern_token("camera")
+                camera_target_ids = np.array(
+                    [self._stage_paths.intern_path(path) for path in camera_paths], dtype=np.uint64
+                )
+                self._stage.write_attribute(
+                    render_product_query,
+                    camera_attribute,
+                    ordinal=self._current_ordinal,
+                    tensors=camera_target_ids,
+                    is_array=True,
+                    semantic=ovstage.AttributeSemantic.RELATIONSHIP_PATH_ID,
+                ).wait()
         self._stage_paths.destroy_path_list(render_product_paths)
 
         self._camera_paths_list = self._stage_paths.create_path_list_from_strings(camera_paths)
@@ -1870,23 +1881,27 @@ class OVRTXRenderer(BaseRenderer):
 
         # Resetting the xform stack makes omni:xform the absolute world transform, preventing
         # ancestor transforms (env root, asset root) from compounding on top of the camera pose.
-        self._stage.write_attribute(
-            self._camera_xform_query,
-            "omni:resetXformStack",
-            ordinal=self._current_ordinal,
-            tensors=np.full(num_envs, True, dtype=np.bool_),
-            is_array=False,
-        ).wait()
+        with Timer("[TIMING] ovrtx.pin_reset_xform_stack"):
+            self._stage.write_attribute(
+                self._camera_xform_query,
+                "omni:resetXformStack",
+                ordinal=self._current_ordinal,
+                tensors=np.full(num_envs, True, dtype=np.bool_),
+                is_array=False,
+            ).wait()
 
-        self._setup_xform_bindings_ovstage()
-        self._setup_deformable_bindings_ovstage(num_envs)
-        self._setup_particle_bindings_ovstage()
-        self._setup_cable_bindings_ovstage()
+        with Timer("[TIMING] ovrtx.setup_bindings"):
+            self._setup_xform_bindings_ovstage()
+            self._setup_deformable_bindings_ovstage(num_envs)
+            self._setup_particle_bindings_ovstage()
+            self._setup_cable_bindings_ovstage()
 
         # Commit all init-time writes then attach. attach_ovstage happens last so the renderer
         # immediately sees the fully-configured scene on its first step.
-        self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
-        self._renderer.attach_ovstage(self._stage)
+        with Timer("[TIMING] ovrtx.seal_setup_ordinal"):
+            self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
+        with Timer("[TIMING] ovrtx.attach_ovstage"):
+            self._renderer.attach_ovstage(self._stage)
         logger.info("OVRTX loaded USD from string successfully via ovstage")
         self._current_ordinal += 1
 

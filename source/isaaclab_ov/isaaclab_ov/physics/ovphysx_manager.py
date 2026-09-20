@@ -1036,8 +1036,12 @@ class OvPhysxManager(PhysicsManager):
         # binding fast path expects). Features that need distinct authored
         # physics in every environment request the full stage; missing
         # heterogeneous clone targets are materialized in its flattened layer.
+        # TEMPORARY benchmarking instrumentation; remove before review.
+        from isaaclab.utils.timer import Timer  # noqa: PLC0415
+
         cls._rearm_pending_clones()
-        stage_usda = cls._serialize_selected_stage(sim.stage)
+        with Timer("[TIMING] ovphysx.serialize_stage"):
+            stage_usda = cls._serialize_selected_stage(sim.stage)
         cls._stage_usda = stage_usda
 
         if cls._physx is None:
@@ -1049,15 +1053,18 @@ class OvPhysxManager(PhysicsManager):
             # cached runtime; PHYSICS_READY after this method rebuilds them.
             cls._prepare_physx_for_stage_reuse()
 
-        cls._attach_ovstage(stage_usda)
+        with Timer("[TIMING] ovphysx.attach_ovstage"):
+            cls._attach_ovstage(stage_usda)
         logger.info("OvPhysxManager: attached OVStage to ovphysx (device=%s)", ovphysx_device)
 
-        cls._replay_pending_clones(cls._physx, requires_full_stage=cls._requires_full_stage)
+        with Timer("[TIMING] ovphysx.replay_pending_clones"):
+            cls._replay_pending_clones(cls._physx, requires_full_stage=cls._requires_full_stage)
 
         # GPU bodies must be re-warmed after every OVStage attachment: the cached PhysX
         # instance carries its old buffer layout from the previous stage.
         if ovphysx_device == "gpu":
-            cls._warmup_physx(cls._physx)
+            with Timer("[TIMING] ovphysx.warmup"):
+                cls._warmup_physx(cls._physx)
 
         # Initialize the SceneDataBackend now that the wheel's PhysX is live and
         # the OVStage is attached. The central
