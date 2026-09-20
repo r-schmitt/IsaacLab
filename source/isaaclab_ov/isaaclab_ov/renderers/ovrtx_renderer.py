@@ -1653,10 +1653,14 @@ class OVRTXRenderer(BaseRenderer):
             self._init_fields_legacy()
 
     def _initialize_from_spec(self, spec: CameraRenderSpec) -> None:
-        if self._use_ovstage:
-            self._initialize_from_spec_ovstage(spec)
-        else:
-            self._initialize_from_spec_legacy(spec)
+        # TEMPORARY benchmarking instrumentation; remove before review.
+        from isaaclab.utils.timer import Timer  # noqa: PLC0415
+
+        with Timer("[TIMING] ovrtx.initialize_from_spec (total)"):
+            if self._use_ovstage:
+                self._initialize_from_spec_ovstage(spec)
+            else:
+                self._initialize_from_spec_legacy(spec)
 
     def _setup_xform_bindings(self) -> None:
         if self._use_ovstage:
@@ -1882,12 +1886,16 @@ class OVRTXRenderer(BaseRenderer):
             raise RuntimeError("Expected a render product declared by prepare_cameras")
         render_product_path = self._render_product_paths[0]
 
+        # TEMPORARY benchmarking instrumentation; remove before review.
+        from isaaclab.utils.timer import Timer  # noqa: PLC0415
+
         # The serialization physics already populated from, so both consumers see one scene. It
         # carries the render product contributed by prepare_cameras.
-        combined_usd_string = shared_stage_usda().resolve(
-            SimulationContext.instance().stage,
-            self._clone_plan,
-        )
+        with Timer("[TIMING] ovrtx.serialize_shared_stage"):
+            combined_usd_string = shared_stage_usda().resolve(
+                SimulationContext.instance().stage,
+                self._clone_plan,
+            )
 
         # If temp_usd_dir is set, write the combined USD stage to a temporary file.
         if self.cfg.temp_usd_dir is not None:
@@ -1899,14 +1907,17 @@ class OVRTXRenderer(BaseRenderer):
         # than a second stage holding a second resident copy of the scene. Released rather than
         # destroyed: it outlives this renderer whenever physics still holds it.
         owner = ovstage_owner()
-        self._shared_stage = owner.acquire(combined_usd_string)
+        with Timer("[TIMING] ovrtx.acquire_shared_stage"):
+            self._shared_stage = owner.acquire(combined_usd_string)
         self._ovstage_exit_stack.callback(owner.release)
         self._stage = self._shared_stage.stage
         self._stage_paths = self._shared_stage.paths
 
         if num_envs > 1:
-            self._clone_sources_ovstage()
-            self._update_scene_partitions_after_clone_ovstage(num_envs)
+            with Timer("[TIMING] ovrtx.clone_sources"):
+                self._clone_sources_ovstage()
+            with Timer("[TIMING] ovrtx.scene_partitions"):
+                self._update_scene_partitions_after_clone_ovstage(num_envs)
 
         self._initialized_scene = True
 
@@ -1916,19 +1927,20 @@ class OVRTXRenderer(BaseRenderer):
         # cameras, so the RenderProduct must be pointed at the freshly-interned camera path ids to discover every
         # camera for tiled rendering.
         render_product_paths = self._stage_paths.create_path_list_from_strings([render_product_path])
-        with self._stage.query_from_path_list(render_product_paths) as render_product_query:
-            camera_attribute = self._stage_paths.intern_token("camera")
-            camera_target_ids = np.array(
-                [self._stage_paths.intern_path(path) for path in camera_paths], dtype=np.uint64
-            )
-            self._stage.write_attribute(
-                render_product_query,
-                camera_attribute,
-                ordinal=self._output_ordinal(),
-                tensors=camera_target_ids,
-                is_array=True,
-                semantic=ovstage.AttributeSemantic.RELATIONSHIP_PATH_ID,
-            ).wait()
+        with Timer("[TIMING] ovrtx.render_product_cameras"):
+            with self._stage.query_from_path_list(render_product_paths) as render_product_query:
+                camera_attribute = self._stage_paths.intern_token("camera")
+                camera_target_ids = np.array(
+                    [self._stage_paths.intern_path(path) for path in camera_paths], dtype=np.uint64
+                )
+                self._stage.write_attribute(
+                    render_product_query,
+                    camera_attribute,
+                    ordinal=self._output_ordinal(),
+                    tensors=camera_target_ids,
+                    is_array=True,
+                    semantic=ovstage.AttributeSemantic.RELATIONSHIP_PATH_ID,
+                ).wait()
         self._stage_paths.destroy_path_list(render_product_paths)
 
         self._camera_paths_list = self._stage_paths.create_path_list_from_strings(camera_paths)
@@ -1940,23 +1952,28 @@ class OVRTXRenderer(BaseRenderer):
 
         # Resetting the xform stack makes omni:xform the absolute world transform, preventing
         # ancestor transforms (env root, asset root) from compounding on top of the camera pose.
-        self._pin_reset_xform_stack_ovstage(self._camera_xform_query)
+        with Timer("[TIMING] ovrtx.pin_reset_xform_stack"):
+            self._pin_reset_xform_stack_ovstage(self._camera_xform_query)
 
-        self._setup_xform_bindings_ovstage()
-        self._setup_deformable_bindings_ovstage(num_envs)
-        self._setup_particle_bindings_ovstage()
-        self._setup_cable_bindings_ovstage()
+        with Timer("[TIMING] ovrtx.setup_bindings"):
+            self._setup_xform_bindings_ovstage()
+            self._setup_deformable_bindings_ovstage(num_envs)
+            self._setup_particle_bindings_ovstage()
+            self._setup_cable_bindings_ovstage()
 
         # Commit all init-time writes then attach. attach_ovstage happens last so the renderer
         # immediately sees the fully-configured scene on its first step.
         setup_ordinal = self._output_ordinal()
-        self._shared_stage.seal(setup_ordinal)
-        self._renderer.attach_ovstage(self._stage)
+        with Timer("[TIMING] ovrtx.seal_setup_ordinal"):
+            self._shared_stage.seal(setup_ordinal)
+        with Timer("[TIMING] ovrtx.attach_ovstage"):
+            self._renderer.attach_ovstage(self._stage)
         # The clone, the render product's camera relationship and the scene partitions above are
         # structural edits committed after the population this stage was attached at. ovstage's
         # shared-Stage sequencing has the renderer take those up explicitly; only a one-shot
         # initial load is rebuilt implicitly by the first step.
-        self._renderer.update_from_stage(setup_ordinal)
+        with Timer("[TIMING] ovrtx.update_from_stage"):
+            self._renderer.update_from_stage(setup_ordinal)
         logger.info("OVRTX loaded USD from string successfully via ovstage")
         self._current_ordinal = None
 
