@@ -267,11 +267,20 @@ class PhysicsManager(ABC):
             event: The event to dispatch.
             payload: Optional data to pass to callbacks.
         """
-        matching = [(cid, cb, order) for cid, (ev, cb, order, name, sub) in cls._callbacks.items() if ev == event]
+        matching = [
+            (cid, cb, order, name) for cid, (ev, cb, order, name, sub) in cls._callbacks.items() if ev == event
+        ]
         matching.sort(key=lambda x: x[2])
 
-        for _, callback, _ in matching:
+        # TEMPORARY benchmarking instrumentation; remove before review.
+        import time as _time  # noqa: PLC0415
+
+        for _, callback, _, _name in matching:
+            _started = _time.perf_counter()
             callback(payload)
+            _elapsed = _time.perf_counter() - _started
+            if _elapsed >= 1.0:
+                print(f"[TIMING] dispatch.{event.name}.{_name} Last: {_elapsed:.6f} s", flush=True)
 
     @classmethod
     def clear_callbacks(cls) -> None:

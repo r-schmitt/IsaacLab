@@ -265,6 +265,10 @@ class OvPhysxView:
     # DLPack capsules can be destroyed before the OVPhysX runtime is released.
     _live_views: ClassVar[set[OvPhysxView]] = set()
 
+    # TEMPORARY benchmarking instrumentation; remove before review.
+    _binding_seconds: ClassVar[float] = 0.0
+    _binding_calls: ClassVar[int] = 0
+
     class OvPhysxViewError(RuntimeError):
         """Base class for all errors raised by :class:`OvPhysxView`."""
 
@@ -636,7 +640,24 @@ class OvPhysxView:
         else:
             kwargs["pattern"] = self._pattern
         try:
+            # TEMPORARY benchmarking instrumentation; remove before review.
+            import time as _time  # noqa: PLC0415
+
+            _started = _time.perf_counter()
             binding = self._physx.create_tensor_binding(**kwargs)
+            _elapsed = _time.perf_counter() - _started
+            OvPhysxView._binding_seconds += _elapsed
+            OvPhysxView._binding_calls += 1
+            if _elapsed >= 0.25 or OvPhysxView._binding_calls % 25 == 0:
+                _target = (
+                    f"paths={len(self._prim_paths)}" if self._prim_paths is not None else f"pattern={self._pattern!r}"
+                )
+                print(
+                    f"[TIMING] create_tensor_binding {tensor_type_name(create_type)} {_target}"
+                    f" Last: {_elapsed:.6f} s, Calls: {OvPhysxView._binding_calls},"
+                    f" Cumulative: {OvPhysxView._binding_seconds:.3f} s",
+                    flush=True,
+                )
         except Exception as exc:  # noqa: BLE001 -- wheel raises bare exceptions; surface the cause below
             # The wheel raises both for "type not applicable to these prims" and for genuine
             # failures (init/ABI/OOM); we can't tell them apart without a wheel-side exception
