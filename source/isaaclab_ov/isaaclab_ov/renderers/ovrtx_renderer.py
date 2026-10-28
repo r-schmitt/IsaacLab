@@ -1206,6 +1206,8 @@ class OVRTXMesh:
         self.resources = contextlib.ExitStack()
         self.stage = None
         self._native_resources = self.resources.enter_context(contextlib.ExitStack())
+        self._root = path
+        self._generation = 0
         self._appearance = (True, (0.7, 0.7, 0.7), 0.5, 0.0, 1.0)
         self._texture = None
         self._face_counts = None
@@ -1308,6 +1310,10 @@ class OVRTXMesh:
                 sampler = UsdShade.Shader.Get(self.stage, "/Mesh/Material/Texture")
                 sampler.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set((*appearance[1], 1.0))
             self._native_resources.close()
+            # OVRTX 0.6 stops rendering a reference re-added at a removed reference's path once it is written
+            # before the next render, so each population uses a new path.
+            self.path = f"{self._root}/Generation{self._generation}"
+            self._generation += 1
             usd = self.stage.GetRootLayer().ExportToString()
             if self.renderer._use_ovstage:
                 reference = ovstage.population.add_usd_reference_from_string(self.renderer.scene.stage, usd, self.path)
